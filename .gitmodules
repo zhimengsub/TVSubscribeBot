@@ -1,0 +1,3 @@
+[submodule "TVSubscriber"]
+	path = TVSubscriber
+	url = https://github.com/zhimengsub/TVSubscriber.git
