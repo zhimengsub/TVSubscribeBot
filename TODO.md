@@ -9,7 +9,7 @@
 
 `[...=xxx]`表示可选参数，默认值为`xxx`
 
-- 添加需要预约的节目
+- 添加定时预约任务
 
 解析crontab参考库 https://pypi.org/project/crontab/
 
@@ -30,8 +30,17 @@
 > 并且开始执行定时任务（触发定时任务时从该频道搜索是否有匹配的节目，如果有则提示用户是否预约（见后文））
 
 
+- 添加单次预约节目
+
+`/subscribe once <channel keyword> <program keyword>`
+
+> 频道关键字匹配同上
+>
+> 节目关键字如果有多个匹配，则直接触发检查预约事件，每个匹配询问一次用户是否订阅（见后文），如果无匹配则报错
+
+
 - 查看已添加的定时任务
-`/subscribe list`
+  `/subscribe list`
 
 ```
 bot
