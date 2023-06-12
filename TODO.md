@@ -13,7 +13,7 @@
 
 解析crontab参考库 https://pypi.org/project/crontab/
 
-`/subscribe add <channel keyword> <program keyword> [contab='0 10 * * *']`
+`/subscribe add <channel keyword> <program keyword> [crontab='0 10 * * *']`
 
 > `<channel keyword>` 和 `<program keyword>` 不一定要输入全名，作为关键字进行匹配
 >
@@ -52,7 +52,7 @@ bot
 
 - 修改任务的触发时间
 
-`/subscribe contab <index> <contab>`
+`/subscribe crontab <index> <crontab>`
 
 - 暂停一个任务
 
