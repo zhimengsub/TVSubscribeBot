@@ -1,3 +1,9 @@
 [submodule "TVSubscriber"]
-	path = TVSubscriber
+	path = tvsubscriber
 	url = https://github.com/zhimengsub/TVSubscriber.git
+[submodule "command_handler"]
+	path = command_handler
+	url = https://github.com/barryZZJ/command_handler
+[submodule "tvsubscriber"]
+	path = tvsubscriber
+	url = https://github.com/zhimengsub/TVSubscriber
