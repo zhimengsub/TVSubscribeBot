@@ -1,23 +1,36 @@
+import json
 import sqlite3
+from pathlib import Path
 from typing import Optional
 
-from .consts import CACHE
-# from TVSubscriber import NETWORKS
-from tvsubscriber.models import Channel
-from .widthConv import convertline
+from tvsubscribebot.tv_subscriber.tvsubscriber.models import Channel
+from tvsubscribebot.utils.consts import CACHE_DB, CACHE_JSON
+from tvsubscribebot.utils.widthConv import convertline
 
 
 class CacheManager:
-    def __init__(self):
+    def __init__(self, dbfile: Path = CACHE_DB):
+        self.dbfile = dbfile
+        # self.jsonfile = jsonfile
         self.conn: Optional[sqlite3.Connection] = None
         self._isclosed: bool = True
         self.create_table()
 
+    # tvsubscribebot
+    # def store_dict(self, data: dict):
+    #     with self.jsonfile.open('w', encoding='utf8') as f:
+    #         json.dump(data, f, indent=4)
+    #
+    # def load_dict(self) -> dict:
+    #     with self.jsonfile.open('r', encoding='utf8') as f:
+    #         return json.load(f)
+
+    # channels
     def connect(self):
         if not self._isclosed:
             return
         self._isclosed = False
-        self.conn = sqlite3.connect(str(CACHE))
+        self.conn = sqlite3.connect(str(self.dbfile))
         self.c = self.conn.cursor()
 
     def close(self):
@@ -27,8 +40,8 @@ class CacheManager:
         self._isclosed = True
 
     def create_table(self):
-        # note: 频道名不唯一，甚至同一个network下频道名也可能不唯一
         self.connect()
+        # note: 频道名不唯一，甚至同一个network下频道名也可能不唯一
         self.c.execute("""CREATE TABLE IF NOT EXISTS 
             channels (
                 service TEXT NOT NULL, 
@@ -58,9 +71,6 @@ class CacheManager:
         self.close()
 
     def find_channels(self, keyword: str) -> list[Channel]:
-        """
-        return: list[(network, Channel)]
-        """
         # / around keyword (after stripping quotations) means word boundary
         keyword = convertline(keyword)
         if not keyword.startswith('/'):

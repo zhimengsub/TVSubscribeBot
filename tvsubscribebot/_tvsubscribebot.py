@@ -1,68 +1,99 @@
 import re
-from typing import Dict, Optional, Iterable, List, Set
+from pathlib import Path
+from typing import Dict, Optional, List, TypeVar, Coroutine
 import inspect
+
+import httpx
 import pytz
 from loguru import logger
 
-from command_handler import Application, Update, Chat, User, CommandHandler, MessageHandler, \
-    ConversationHandler, ContextTypes, filters, Message, StringArgConverter
+from dumb_bot.dumbbot import DumbApplication, Update, Chat, StringArgConverter, ChainCommandHandler
+from dumb_bot.dumbbot.ext import MessageHandler, ConversationHandler, ContextTypes, filters, ApplicationBuilder, PicklePersistence, PersistenceInput
+from dumbbot import DumbBot
 from tvsubscriber import ApiException
 from tvsubscriber import NETWORK_NAMES, NETWORKS
 from tvsubscriber import TVSubscriber, Channel, Event, Reservation
 
-from utils.cache import CacheManager
-from utils.casts import *
-from utils.errors import BadResultException
-from utils.widthConv import convertline
+from .utils.cache import CacheManager
+from .utils.casts import *
+from .utils.consts import CACHE_DB, PERSISTENCE, PERSISTENCE_UPDATE_INTERVAL
+from .utils.errors import BadResultException
+from .utils.widthConv import convertline
 
-DEFAULT_USER = User(-1)
-DEFAULT_CHAT = Chat(-1)
+RESULT_TEXT = str
+EVENT_ID = TypeVar('EVENT_ID', bound=int)
 
 __all__ = (
     'TVSubscribeBot',
 )
 
-
+#TODO commit current version, fix submodule problem
 class TVSubscribeBot:
+    """This class have to run in main thread."""
     _END = ConversationHandler.END
     _NOW_MATCHED = 1  # 输出单次检查结果，询问用户订阅哪些，回复订阅结果
 
-    def __init__(self, timezone=pytz.timezone('Asia/Shanghai')):
-        # TODO 保存定时任务记录
+    def __init__(
+        self,
+        persistence_filepath: Path = PERSISTENCE,
+        update_interval: float = PERSISTENCE_UPDATE_INTERVAL,
+        timezone: pytz.tzinfo = pytz.timezone('Asia/Shanghai'),
+        dbfile: Path = CACHE_DB
+    ):
+        # see https://github.com/python-telegram-bot/python-telegram-bot/wiki/Making-your-bot-persistent
+        # TODO 注意timezone对于定时任务的影响
         self.timezone = timezone
 
-        self._app = Application(self.timezone)
-        self._cache = CacheManager()
+        self.persistence = PicklePersistence(
+            persistence_filepath,
+            store_data=PersistenceInput(callback_data=False),
+            update_interval=update_interval,
+            single_file=False,
+        )
+        self._app: DumbApplication = ApplicationBuilder()\
+            .application_class(DumbApplication)\
+            .bot(DumbBot())\
+            .persistence(self.persistence)\
+            .post_init(self._initialize)\
+            .build()
+
+        # persistent bot data (loaded at self._initialize)
+
+        # TODO store/load schedule tasks into bot_data
+        # TODO serialize app's jobqueue need APScheduler's logic: https://github.com/python-telegram-bot/ptbcontrib/tree/main/ptbcontrib/ptb_sqlalchemy_jobstore
+
+        # cache
+        self._cache = CacheManager(dbfile)
         # TODO 所有频道/节目查找全去找cache，同时缓存epgtoken
-        #  开启额外线程定时刷新cache（可以尝试设置expire）
-        #  channel cache每天刷新epgtoken
+        #  基于jobqueue, 定时刷新cache（可以尝试设置expire）
+        #  channel cache 每天刷新 epgtoken, 如果epgtoken不能用则手动刷新
         #  event cache 每小时刷新一次，同时要清理已经播完的节目（保留正在播的）
-        #  可以基于jobqueue
+        #  subscribed cache，通过本机器人订阅的手动加入cache，另外定期拉取userinfo更新
 
         # define handlers
-        cmd_handlers_simple = CommandHandler(
+        cmd_handlers_simple = ChainCommandHandler(
             '/sub',
             sub_command_handlers=[
-                CommandHandler('help', self._help),
-                CommandHandler('login', self._login),
-                CommandHandler('search', self._search),
-                # CommandHandler('list', self.task_list),
-                # CommandHandler('edit', self.task_edit),
-                # CommandHandler('disable', self.task_disable),
-                # CommandHandler('enable', self.task_enable),
-                # CommandHandler('remove', self.task_remove),
-                # CommandHandler('check', self.task_check),
-                # CommandHandler('refresh_cache', self.refresh_cache)
+                ChainCommandHandler('help', self._help),
+                ChainCommandHandler('login', self._login),
+                ChainCommandHandler('search', self._search),
+                # ChainCommandHandler('list', self.task_list),
+                # ChainCommandHandler('edit', self.task_edit),
+                # ChainCommandHandler('disable', self.task_disable),
+                # ChainCommandHandler('enable', self.task_enable),
+                # ChainCommandHandler('remove', self.task_remove),
+                # ChainCommandHandler('check', self.task_check),
+                # ChainCommandHandler('refresh_cache', self.refresh_cache)
             ]
         )
 
         # /sub now
         conv_sub_now = ConversationHandler(
             entry_points=[
-                CommandHandler(
+                ChainCommandHandler(
                     '/sub',
                     sub_command_handlers=[
-                        CommandHandler('now', self._now)
+                        ChainCommandHandler('now', self._now)
                     ]
                 )
             ],
@@ -72,44 +103,32 @@ class TVSubscribeBot:
                 ],
             },
             fallbacks=[
-                CommandHandler(
+                ChainCommandHandler(
                     '/sub',
                     sub_command_handlers=[
-                        CommandHandler('cancel', self._cancel_subscribe)
+                        ChainCommandHandler('cancel', self._cancel_subscribe)
                     ]
                 ),
                 MessageHandler(filters.ALL, self._resend_input_ids_prompt),
-            ]
+            ],
+            persistent=True,
+            name='conv_sub_now',
         )
+        # TODO /sub daily
+        # TODO use chat_data to persistent scheduled tasks (call _app.mark_data_for_update_persistence)
+        #     see https://github.com/python-telegram-bot/python-telegram-bot/wiki/Storing-bot%2C-user-and-chat-related-data
 
-        # /sub daily
-        # TODO
-
-        # interactive subscription
-        # TODO
+        # TODO interactive subscription
 
         # set backup handler
-        backup_handler = CommandHandler('/sub', self._help)
+        backup_handler = ChainCommandHandler('/sub', self._help)
         # register handlers
         self._app.add_handler(cmd_handlers_simple)
         self._app.add_handler(conv_sub_now)
         self._app.add_handler(backup_handler)
 
-        self._ids = {
-            'update': 0,
-            'message': 0,
-        }
+        self._callbacks: List[Callable[[RESULT_TEXT, Chat], Coroutine]] = []
 
-        self._last_matched_events: Dict[Chat, List[Event]] = {}
-        self._last_reservations: Dict[Chat, List[Reservation]] = {}
-        self._last_successed_ids: Dict[Chat, List[int]] = {}
-        self._last_failed_ids: Dict[Chat, List[int]] = {}
-
-        self._ret_msg: Optional[str] = None  # msg to be returned
-
-        self._subscribers: Dict[Chat, TVSubscriber] = {}
-
-        # TODO consider wrap dynamic model from pydantic
         #  https://docs.pydantic.dev/latest/usage/models/#dynamic-model-creation
         self._usages = {
             '_help': StringArgConverter('/sub help - 显示此帮助'),
@@ -153,6 +172,7 @@ class TVSubscribeBot:
                       cast_ints),
                 startTime=(datetime.time, None, cast_time),
             ),
+            '_userinfo': StringArgConverter('/sub userinfo - 查看当前账户信息'),
             '_list': StringArgConverter('/sub list - 查看已添加的定时任务'),
             '_check': StringArgConverter(
                 '/sub check <ids> - 手动触发定时任务',
@@ -191,77 +211,70 @@ class TVSubscribeBot:
             )
         }
 
-    # public methods
-    def handle_msg(
-        self,
-        msg: str,
-        date: datetime.datetime = None,
-        chat: Chat = DEFAULT_CHAT,
-        from_user: User = DEFAULT_USER,
-    ) -> Optional[str]:
-        """处理输入字符串，返回响应字符串。None表示无格式匹配"""
-        # TODO 作为子线程运行，在查找期间如果有新的指令匹配则提示请等待上次运行结束，并添加强行终止线程指令
-        date = date or datetime.datetime.now(self.timezone)
-        self._ret_msg = None
-        self._app.process_update(Update(
-            self._next_update_id,
-            Message(
-                self._next_message_id,
-                date=date,
-                chat=chat,
-                from_user=from_user,
-                text=msg
-            )
-        ))
-        # 空字符串表示不匹配任何指令格式，无操作
-        return self._ret_msg
+    async def _initialize(self, application: DumbApplication):
+        # load persisted bot data
+        ...
 
-    def _help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self._set_retmsg(self._help_msg())
+    # public utils
+    def listen_forever(self, listen: str = "127.0.0.1", port: int = 18888):
+        """Start server"""
+        logger.info('listening at {}:{}', listen, port)
+        self._app.run(listen, port)
 
-    # commands
-    def _login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def register_callback(self, func: Callable[[RESULT_TEXT, Chat], Coroutine]) -> Callable[[RESULT_TEXT, Chat], Coroutine]:
+        """Register coroutine callback for handling result text, can be used as a decorator."""
+        self._callbacks.append(func)
+        return func
+
+    # handlers
+    async def _help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        usages = [usage.text for usage in self._usages.values() if usage.text.startswith('/sub')]
+        await self._notify_handle_result('\n'.join(usages), update)
+
+    async def _login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/sub login <username> <password>"""
-        if len(context.args) != 2:
-            self._set_retmsg('StringArgConverter:\n' + self._usages['login'])
+        currfunc = inspect.currentframe().f_code.co_name
+        usage = self._usages[currfunc]
+        if not usage.check_arg_len(context.args):
+            await self._notify_handle_result(usage.usage, update)
             return
 
         username, password = context.args
         subscriber = TVSubscriber()
         try:
             res = subscriber.login(username, password)
-        except ApiException as e:
-            self._set_retmsg(str(e))
+        except (ApiException, httpx.ConnectError) as e:
+            await self._notify_handle_result(str(e), update)
             return
-        curr_chat = update.message.chat
-        self._subscribers[curr_chat] = subscriber
-        self._set_retmsg(res['information'])
+        context.user_data['subscriber'] = subscriber
+        context.application.mark_data_for_update_persistence(update.effective_user.id)
+        await self._notify_handle_result(res['information'], update)
 
-    def _search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/sub search <channel> <program> [excludeProgram] [detail] [startDate] [startTime] [findFirstMatch]"""
         # TODO add category?
         currfunc = inspect.currentframe().f_code.co_name
         usage = self._usages[currfunc]
         if not usage.check_arg_len(context.args):
-            self._set_retmsg(usage.usage)
+            await self._notify_handle_result(usage.usage, update)
             return
 
-        subscriber = self._subscribers.get(update.message.chat)
-        if not subscriber or not subscriber.is_online():
-            self._set_retmsg('请先登录！')
+        subscriber: TVSubscriber = context.user_data.get('subscriber')
+        if subscriber is None or not subscriber.is_online():
+            await self._notify_handle_result('请先登录！', update)
             return
 
         try:
             channel, program, \
             excludeProgram, detail, startDate, startTime, findFirstMatch = usage.parse_args(context.args)
         except (SyntaxError, TypeError, ValueError) as e:
-            self._set_retmsg('参数错误！\n' + str(e))
+            await self._notify_handle_result('参数错误！\n' + str(e), update)
             return
 
         try:
             channels = self._find_channels(subscriber, channel)
-        except ApiException as e:
-            self._set_retmsg(str(e))
+        except (ApiException, httpx.ConnectError) as e:
+            await self._notify_handle_result(str(e), update)
             return
 
         if len(channels) < 5:
@@ -291,41 +304,41 @@ class TVSubscribeBot:
                 if len(matches) > 0 and findFirstMatch:
                     break
         except (ApiException, BadResultException) as e:
-            self._set_retmsg(str(e))
+            await self._notify_handle_result(str(e), update)
             return
 
         if len(events) == 0:
-            self._set_retmsg('没有找到匹配的节目！')
+            await self._notify_handle_result('没有找到匹配的节目！', update)
             return
 
-        self._set_retmsg(self._make_matched_prompt(events))
+        await self._notify_handle_result(self._make_matched_prompt(events), update)
 
-    def _now(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _now(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """/sub now <channel> <program> [excludeProgram] [detail] [startDate] [startTime] [findFirstMatch] - 执行单次订阅任务"""
         # if not match, return END (nomatch), else return NOW_MATCHED
         # TODO add category?
         currfunc = inspect.currentframe().f_code.co_name
         usage = self._usages[currfunc]
         if not usage.check_arg_len(context.args):
-            self._set_retmsg(usage.usage)
+            await self._notify_handle_result(usage.usage, update)
             return self._END
 
-        subscriber = self._subscribers.get(update.message.chat)
-        if not subscriber or not subscriber.is_online():
-            self._set_retmsg('请先登录！')
+        subscriber: TVSubscriber = context.user_data.get('subscriber')
+        if subscriber is None or not subscriber.is_online():
+            await self._notify_handle_result('请先登录！', update)
             return self._END
 
         try:
             channel, program, \
             excludeProgram, detail, startDate, startTime, findFirstMatch = usage.parse_args(context.args)
         except (SyntaxError, TypeError, ValueError) as e:
-            self._set_retmsg('参数错误！\n' + str(e))
+            await self._notify_handle_result('参数错误！\n' + str(e), update)
             return self._END
 
         try:
             channels = self._find_channels(subscriber, channel)
-        except ApiException as e:
-            self._set_retmsg(str(e))
+        except (ApiException, httpx.ConnectError) as e:
+            await self._notify_handle_result(str(e), update)
             return self._END
 
         if len(channels) < 5:
@@ -348,7 +361,7 @@ class TVSubscribeBot:
                 if len(matches) > 0 and findFirstMatch:
                     break
         except (ApiException, BadResultException) as e:
-            self._set_retmsg(str(e))
+            await self._notify_handle_result(str(e), update)
             return self._END
 
         # if len(events) < 5:
@@ -357,14 +370,17 @@ class TVSubscribeBot:
         logger.info('total matched events found {}', len(events))
 
         if len(events) == 0:
-            self._set_retmsg('没有找到匹配的节目！')
+            await self._notify_handle_result('没有找到匹配的节目！', update)
             return self._END
-        # TODO 过滤掉已订阅的节目，也存个cache比较好，定期更新
-        self._set_retmsg(self._make_matched_prompt(events) + '\n\n' + self._input_ids_prompt())
-        self._last_matched_events[update.message.chat] = events
+        _last_matched_events: Dict[EVENT_ID, Event] = context.chat_data.setdefault('_last_matched_events', {})
+        for ind, event in enumerate(events):
+            _last_matched_events[ind + 1] = event
+
+        # TODO 标记所有已订阅的节目
+        await self._notify_handle_result(self._make_matched_prompt(events) + '\n\n' + self._input_ids_prompt(), update)
         return self._NOW_MATCHED
 
-    def _watch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _watch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         args:
             channel_keyword: str,
@@ -374,8 +390,8 @@ class TVSubscribeBot:
         # TODO check is logged in before every op
         ...
 
-    # conversation states
-    def _subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    # conversation handlers
+    async def _subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
         """用户回复要订阅哪些。可由单次查询/定时任务触发/手动触发等方式调用。
         参数为int或 int separated by ','
         """
@@ -383,24 +399,24 @@ class TVSubscribeBot:
         usage = self._usages[currfunc]
         args = [match.group() for match in context.matches]
         if not usage.check_arg_len(args):
-            self._set_retmsg(usage.usage)
+            await self._notify_handle_result(usage.usage, update)
             return self._END
 
-        subscriber = self._subscribers.get(update.message.chat)
-        if not subscriber or not subscriber.is_online():
-            self._set_retmsg('请先登录！')
+        subscriber: TVSubscriber = context.user_data.get('subscriber')
+        if subscriber is None or not subscriber.is_online():
+            await self._notify_handle_result('请先登录！', update)
             return self._END
 
-        events = self._last_matched_events.get(update.message.chat)
-        if not events:
-            self._set_retmsg('无法获取本次搜索结果！')
+        _last_matched_events: Dict[EVENT_ID, Optional[Event]] = context.chat_data.get('_last_matched_events')
+        if not _last_matched_events:
+            await self._notify_handle_result('无法获取本次搜索结果！', update)
             return self._END
 
         try:
             (ids,) = usage.parse_args(args)
-            assert all(0 <= id <= len(events) for id in ids)
+            assert all(0 <= id <= len(_last_matched_events) for id in ids)
         except (AssertionError, SyntaxError, TypeError, ValueError) as e:
-            self._set_retmsg('序号错误，请重新输入！\n' + str(e))
+            await self._notify_handle_result('序号错误，请重新输入！\n' + str(e), update)
             return
         if any(id == 0 for id in ids):
             ids = [0]
@@ -408,63 +424,72 @@ class TVSubscribeBot:
             # 去重+排序
             ids = sorted(set(ids))
 
-        # dict[id, event]
-        avail_event_dict = {i + 1: event for i, event in enumerate(events)}
-
-        # last_reservations = self._last_reservations.get(update.message.chat)
-        # last_successed_ids = self._last_successed_ids.get(update.message.chat)
-        last_failed_ids = self._last_failed_ids.get(update.message.chat)
-        if last_failed_ids:
-            avail_event_dict = {id: avail_event_dict[id] for id in last_failed_ids}
-
-        is_sub_all = ids[0] == 0
+        should_sub_all = ids[0] == 0
         reservations = []
         successed_ids = []
         failed_ids = []
         errors = []
-        # 注意序号的换算
-        if not is_sub_all:
+        if should_sub_all:
+            avail_events = _last_matched_events
+        else:
             # 根据用户输入序号筛选
-            avail_event_dict = {id: avail_event_dict[id] for id in ids}
+            avail_events = {id: _last_matched_events[id] for id in ids}
 
-        for id, event in avail_event_dict.items():
+        for id, event in avail_events.items():
+            if event is None:
+                # this is a previously successfully subscribed event
+                continue
             try:
-                res = self._do_subscribe(subscriber, event)
-                reservations.append(res)
+                reservation = self._do_subscribe(subscriber, event)
+                reservations.append(reservation)
                 successed_ids.append(id)
-            except ApiException as e:
+            except (ApiException, httpx.ConnectError) as e:
                 failed_ids.append(id)
                 errors.append(str(e))
 
-        # 记录已订阅成功的id，重试时跳过，注意处理0.
-        self._last_reservations[update.message.chat] = reservations
-        self._last_successed_ids[update.message.chat] = successed_ids
-        self._last_failed_ids[update.message.chat] = failed_ids
-
         try:
             userinfo = subscriber.get_userinfo()
-            self._ret_msg = '余额：' + userinfo.wallet + '元\n'
-        except ApiException:
-            self._ret_msg = '余额获取失败\n'
+            result_text = '余额：' + userinfo.wallet + '元\n'
+        except (ApiException, httpx.ConnectError):
+            result_text = '余额获取失败\n'
 
         if successed_ids:
-            self._ret_msg += '预约成功：' + ', '.join(map(str, successed_ids)) + '\n'
+            result_text += '预约成功：' + ', '.join(map(str, successed_ids)) + '\n'
+            # remove event if success
+            for id in successed_ids:
+                _last_matched_events[id] = None
 
         if failed_ids:
             # 如果有失败，可再次输入需要重新预约的序号
-            self._ret_msg += '预约失败：' + ', '.join(f'{id}（{e}）' for id, e in zip(failed_ids, errors)) + '\n' + self._input_ids_prompt() + '\n（成功的节目将被跳过。）'
-            return
+            result_text += '预约失败：' + ', '.join(f'{id}（{e}）' for id, e in zip(failed_ids, errors)) + '\n' + self._input_ids_prompt() + '\n（成功的节目将被跳过。）'
 
+        await self._notify_handle_result(result_text, update)
+
+        if failed_ids:
+            # stay in current state if any failed
+            return
+        # clear data if all success
+        context.chat_data.pop('_last_matched_events')
         return self._END
 
-    # private methods
-    def _cancel_interactive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # conversation state commands
+    async def _cancel_interactive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         ...
 
-    def _cancel_subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _cancel_subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         # 退出会话、删除上次的匹配结果、
-        del self._last_matched_events[update.message.chat]
+        context.chat_data.pop('_last_matched_events')
+        await self._notify_handle_result('已终止', update)
         return self._END
+
+    async def _resend_input_ids_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._notify_handle_result('输入错误！' + self._input_ids_prompt(), update)
+        return self._NOW_MATCHED
+
+    # private utils
+    @staticmethod
+    def _do_subscribe(subscriber: TVSubscriber, program: Event) -> Reservation:
+        return subscriber.subscribe(program.sid, program.eid, program.tsid, program.onid, program.price, program.network, program.reservetoken)
 
     def _find_channels(self, subscriber: TVSubscriber, keyword: str) -> list[Channel]:
         """
@@ -533,12 +558,6 @@ class TVSubscribeBot:
                     break
         return matches
 
-    def _help_msg(self):
-        msg = ['Usage:']
-        for key, usage in self._usages.items():
-            msg.append(usage.text)
-        return '\n'.join(msg)
-
     @staticmethod
     def _input_ids_prompt() -> str:
         return "请输入需要订阅的序号，0表示全选，多个序号必须用英文逗号','隔开。\n输入/sub cancel终止订阅。"
@@ -572,38 +591,20 @@ class TVSubscribeBot:
         keyword = keyword.replace(r'\*', '.*').replace(r'\?', '.')
         return re.compile(keyword)
 
-    @property
-    def _next_message_id(self):
-        self._ids['message'] += 1
-        return self._ids['message']
-
-    @property
-    def _next_update_id(self):
-        self._ids['update'] += 1
-        return self._ids['update']
-
     def _refresh_channel_cache(self, subscriber: TVSubscriber):
-        # TODO automatic update channel cache every week (channels shouldn't be changing to much)
         self._cache.refresh_table()
         channels = []
         for network in NETWORK_NAMES.keys():
             channels.extend(subscriber.get_channels(network))
         self._cache.insert_channels(channels)
 
-    def _resend_input_ids_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self._set_retmsg('输入错误！' + self._input_ids_prompt())
-        return self._NOW_MATCHED
-
-    def _set_retmsg(self, msg:str):
-        self._ret_msg = msg
+    async def _notify_handle_result(self, text: RESULT_TEXT, update: Update):
+        for callback in self._callbacks:
+            await callback(text, update.effective_chat)
 
     def _show_sub_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ...
         return self._END
-
-    @staticmethod
-    def _do_subscribe(subscriber: TVSubscriber, program: Event) -> Reservation:
-        return subscriber.subscribe(program.sid, program.eid, program.tsid, program.onid, program.price, program.network, program.reservetoken)
 
     @staticmethod
     def _update_epgtoken(subscriber: TVSubscriber, target_channels: List[Channel]):
@@ -626,6 +627,3 @@ class TVSubscribeBot:
                 seen.append(target_channel)
                 if len(seen) == target_len:
                     break
-
-
-

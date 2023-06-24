@@ -1,9 +1,6 @@
-[submodule "TVSubscriber"]
-	path = tvsubscriber
-	url = https://github.com/zhimengsub/TVSubscriber.git
-[submodule "command_handler"]
-	path = command_handler
-	url = https://github.com/barryZZJ/command_handler
-[submodule "tvsubscriber"]
-	path = tvsubscriber
+[submodule "tvsubscribebot/dumb_bot"]
+	path = tvsubscribebot/dumb_bot
+	url = https://github.com/barryZZJ/dumb_bot
+[submodule "tvsubscribebot/tvsubscriber"]
+	path = tvsubscribebot/tvsubscriber
 	url = https://github.com/zhimengsub/TVSubscriber
