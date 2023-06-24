@@ -213,6 +213,8 @@ class TVSubscribeBot:
 
     async def _initialize(self, application: DumbApplication):
         # load persisted bot data
+        print(application.chat_data)
+        print(application.user_data)
         ...
 
     # public utils
