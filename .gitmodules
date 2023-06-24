@@ -2,5 +2,5 @@
 	path = tvsubscribebot/dumb_bot
 	url = https://github.com/barryZZJ/dumb_bot
 [submodule "tvsubscribebot/tvsubscriber"]
-	path = tvsubscribebot/tvsubscriber
+	path = tvsubscribebot/tv_subscriber
 	url = https://github.com/zhimengsub/TVSubscriber
