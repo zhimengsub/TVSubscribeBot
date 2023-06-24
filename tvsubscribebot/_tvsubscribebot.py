@@ -27,7 +27,6 @@ __all__ = (
     'TVSubscribeBot',
 )
 
-#TODO commit current version, fix submodule problem
 class TVSubscribeBot:
     """This class have to run in main thread."""
     _END = ConversationHandler.END
