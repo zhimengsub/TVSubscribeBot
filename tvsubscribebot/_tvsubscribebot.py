@@ -1,243 +1,246 @@
-import re
-from pathlib import Path
-from typing import Dict, Optional, List, TypeVar, Coroutine
 import inspect
+from pathlib import Path
+from typing import Coroutine, TYPE_CHECKING, Union, TypeVar
+from typing import Dict, Optional, List
+from uuid import uuid4
 
 import httpx
-import pytz
+import pymongo.errors
 from loguru import logger
+from ptbcontrib.ptb_jobstores import PTBMongoDBJobStore
+from telegram.ext import Job
 
-from dumb_bot.dumbbot import DumbApplication, Update, Chat, StringArgConverter, ChainCommandHandler
-from dumb_bot.dumbbot.ext import MessageHandler, ConversationHandler, ContextTypes, filters, ApplicationBuilder, PicklePersistence, PersistenceInput
-from dumbbot import DumbBot
-from tvsubscriber import ApiException
-from tvsubscriber import NETWORK_NAMES, NETWORKS
-from tvsubscriber import TVSubscriber, Channel, Event, Reservation
-
+from dumb_bot.dumbbot import DumbApplication, DumbBot, Chat
+from dumb_bot.dumbbot import Update, StringArgConverter, ChainCommandHandler
+from dumb_bot.dumbbot.ext import ApplicationBuilder, PicklePersistence, PersistenceInput
+from dumb_bot.dumbbot.ext import MessageHandler, ConversationHandler, ContextTypes, filters
+from tv_subscriber.tvsubscriber import ApiException
+from tv_subscriber.tvsubscriber import NETWORK_NAMES
+from tv_subscriber.tvsubscriber import TVSubscriber, Event, Reservation
+from ._jobsmanager import JobsManager
+from ._jobsmapping import JobsMapping, JOB_NAME
 from .utils.cache import CacheManager
 from .utils.casts import *
-from .utils.consts import CACHE_DB, PERSISTENCE, PERSISTENCE_UPDATE_INTERVAL
+from .utils.consts import DB_CACHE, PERSISTENCE_PKL, PERSISTENCE_UPDATE_INTERVAL, DB_JOBSTORE, KEY_SUBBED_EVENTS, \
+    INT_UPDATE_SUBBED_EVENTS, JOB_UPDATE_SUBBED_EVENT_PREFIX
+from .utils.consts import JOBKEY_THIS_UPDATE, JOBKEY_DAILY_JOB_ARGS
+from .utils.consts import KEY_JOB_MAPPING, KEY_JOB_NAME_ONCE, KEY_LAST_DAILY_JOB_ARGS, KEY_UNHANDLED_MATCHES
 from .utils.errors import BadResultException
-from .utils.widthConv import convertline
+from .utils.handlercallbacks import HandlerCallbacks
+from .utils.searchutils import SearchUtils
+from .utils.types import RESULT_TEXT, JOB_NAME_ONCE, EVENT_DICT
 
-RESULT_TEXT = str
-EVENT_ID = TypeVar('EVENT_ID', bound=int)
+if TYPE_CHECKING:
+    from dumb_bot.dumbbot.ext import Application
 
 __all__ = (
     'TVSubscribeBot',
 )
 
+SUCCESSED_IDS = TypeVar('SUCCESSED_IDS', bound=list[int])
+FAILED_IDS = TypeVar('FAILED_IDS', bound=list[int])
+ALREADY_SUBBED_IDS = TypeVar('ALREADY_SUBBED_IDS', bound=list[int])
+
+
 class TVSubscribeBot:
     """This class have to run in main thread."""
     _END = ConversationHandler.END
-    _NOW_MATCHED = 1  # 输出单次检查结果，询问用户订阅哪些，回复订阅结果
+    _NOW_MATCHES = 1  # 输出单次检查结果，询问用户订阅哪些，回复订阅结果
+    _DAILY_MACHES = 2  # 输出每日任务添加时的检查结果，询问用户是否添加任务
+    _CHECK_DAILY_JOB_MACHES = 3  # 触发定时任务时的检查结果，询问用户是否添加任务
 
     def __init__(
         self,
-        persistence_filepath: Path = PERSISTENCE,
+        persistence_filepath: Path = PERSISTENCE_PKL,
         update_interval: float = PERSISTENCE_UPDATE_INTERVAL,
-        timezone: pytz.tzinfo = pytz.timezone('Asia/Shanghai'),
-        dbfile: Path = CACHE_DB
+        dbfile_jobstore: str = DB_JOBSTORE,
+        dbfile_cache: Path = DB_CACHE,
     ):
-        # see https://github.com/python-telegram-bot/python-telegram-bot/wiki/Making-your-bot-persistent
-        # TODO 注意timezone对于定时任务的影响
-        self.timezone = timezone
-
+        # TODO 检查所有更新chat_data的地方，都要手动加上mark for update
         self.persistence = PicklePersistence(
             persistence_filepath,
             store_data=PersistenceInput(callback_data=False),
             update_interval=update_interval,
             single_file=False,
         )
-        self._app: DumbApplication = ApplicationBuilder()\
-            .application_class(DumbApplication)\
-            .bot(DumbBot())\
-            .persistence(self.persistence)\
-            .post_init(self._initialize)\
+        self._app: Union[DumbApplication, Application] = ApplicationBuilder() \
+            .application_class(DumbApplication) \
+            .bot(DumbBot()) \
+            .persistence(self.persistence) \
+            .post_init(self._initialize) \
             .build()
 
-        # persistent bot data (loaded at self._initialize)
-
-        # TODO store/load schedule tasks into bot_data
-        # TODO serialize app's jobqueue need APScheduler's logic: https://github.com/python-telegram-bot/ptbcontrib/tree/main/ptbcontrib/ptb_sqlalchemy_jobstore
+        # https://github.com/python-telegram-bot/ptbcontrib/blob/main/ptbcontrib/ptb_jobstores/README.md
+        self._app.job_queue.scheduler.add_jobstore(
+            PTBMongoDBJobStore(
+                application=self._app,
+                host=dbfile_jobstore,
+            )
+        )
 
         # cache
-        self._cache = CacheManager(dbfile)
-        # TODO 所有频道/节目查找全去找cache，同时缓存epgtoken
+        self._cache = CacheManager(dbfile_cache)
+        # TODO 优化：所有频道/节目查找全去找cache，同时缓存epgtoken
         #  基于jobqueue, 定时刷新cache（可以尝试设置expire）
         #  channel cache 每天刷新 epgtoken, 如果epgtoken不能用则手动刷新
         #  event cache 每小时刷新一次，同时要清理已经播完的节目（保留正在播的）
-        #  subscribed cache，通过本机器人订阅的手动加入cache，另外定期拉取userinfo更新
 
         # define handlers
-        cmd_handlers_simple = ChainCommandHandler(
+        self.cmd_handlers_simple = ChainCommandHandler(
             '/sub',
             sub_command_handlers=[
-                ChainCommandHandler('help', self._help),
-                ChainCommandHandler('login', self._login),
-                ChainCommandHandler('search', self._search),
-                # ChainCommandHandler('list', self.task_list),
+                ChainCommandHandler('help', self._cmd_help),
+                ChainCommandHandler('login', self._cmd_login),
+                ChainCommandHandler('search', self._cmd_search),
+                ChainCommandHandler('list', self._cmd_list),
                 # ChainCommandHandler('edit', self.task_edit),
                 # ChainCommandHandler('disable', self.task_disable),
                 # ChainCommandHandler('enable', self.task_enable),
-                # ChainCommandHandler('remove', self.task_remove),
-                # ChainCommandHandler('check', self.task_check),
+                ChainCommandHandler('remove', self._cmd_remove),
+                ChainCommandHandler('userinfo', self._cmd_userinfo),
                 # ChainCommandHandler('refresh_cache', self.refresh_cache)
             ]
         )
 
         # /sub now
-        conv_sub_now = ConversationHandler(
+        self.conv_sub_now = ConversationHandler(
             entry_points=[
-                ChainCommandHandler(
-                    '/sub',
-                    sub_command_handlers=[
-                        ChainCommandHandler('now', self._now)
-                    ]
-                )
+                ChainCommandHandler('/sub', sub_command_handlers=[
+                    ChainCommandHandler('now', self._cmd_now)
+                ])
             ],
             states={
-                self._NOW_MATCHED: [
-                    MessageHandler(filters.Regex(r'^[\d,]+$'), self._subscribe)
+                self._NOW_MATCHES: [
+                    MessageHandler(filters.Regex(r'^[\d,]+$'), self._callback_subscribe_now)
                 ],
             },
             fallbacks=[
-                ChainCommandHandler(
-                    '/sub',
-                    sub_command_handlers=[
-                        ChainCommandHandler('cancel', self._cancel_subscribe)
-                    ]
-                ),
-                MessageHandler(filters.ALL, self._resend_input_ids_prompt),
+                MessageHandler(filters.Regex(r'^/sub cancel(?: (now))?$'), self._cancel_conversation),
+                MessageHandler(~filters.Regex(r'^/sub cancel \d+$'), self._prompt_resend),
             ],
             persistent=True,
             name='conv_sub_now',
         )
-        # TODO /sub daily
-        # TODO use chat_data to persistent scheduled tasks (call _app.mark_data_for_update_persistence)
-        #     see https://github.com/python-telegram-bot/python-telegram-bot/wiki/Storing-bot%2C-user-and-chat-related-data
+
+        # /sub daily
+        self.conv_sub_daily = ConversationHandler(
+            entry_points=[
+                ChainCommandHandler('/sub', sub_command_handlers=[
+                        ChainCommandHandler('daily', self._cmd_daily)
+                ])
+            ],
+            states={
+                self._DAILY_MACHES: [
+                    MessageHandler(filters.Regex(r'^[是否]$'), self._daily_job_confirmed)
+                ]
+            },
+            fallbacks=[
+                MessageHandler(filters.Regex(r'^/sub cancel(?: (daily))?$'), self._cancel_conversation),
+                MessageHandler(~filters.Regex(r'^/sub cancel \d+$'), self._prompt_resend),
+            ],
+            persistent=True,
+            name='conv_sub_daily',
+        )
+
+        # /sub check
+        # 如果有未解决的任务，则不允许进入下一步。防止抢了其他定时job的handler
+        self.conv_sub_check = ConversationHandler(
+            entry_points=[
+                ChainCommandHandler('/sub', sub_command_handlers=[
+                    ChainCommandHandler('check', self._cmd_check)
+                ])
+            ],
+            states={
+                self._CHECK_DAILY_JOB_MACHES: [
+                    MessageHandler(filters.Regex(fr'(^[\d,]+)(?: (\d+))?$'), self._callback_subscribe_daily_job)
+                ]
+            },
+            fallbacks=[
+                MessageHandler(filters.Regex(fr'^/sub cancel(?: (\d+))?$'), self._cancel_conversation),
+                MessageHandler(filters.ALL, self._prompt_resend),
+            ],
+            persistent=True,
+            name='conv_check',
+        )
 
         # TODO interactive subscription
 
         # set backup handler
-        backup_handler = ChainCommandHandler('/sub', self._help)
-        # register handlers
-        self._app.add_handler(cmd_handlers_simple)
-        self._app.add_handler(conv_sub_now)
-        self._app.add_handler(backup_handler)
+        self.backup_handler = ChainCommandHandler('/sub', self._cmd_help)
 
-        self._callbacks: List[Callable[[RESULT_TEXT, Chat], Coroutine]] = []
+        self._app.add_handler(self.cmd_handlers_simple)
+        self._app.add_handler(self.conv_sub_now)
+        self._app.add_handler(self.conv_sub_daily)
+        self._app.add_handler(self.conv_sub_check)
+        self._app.add_handler(self.backup_handler)
 
-        #  https://docs.pydantic.dev/latest/usage/models/#dynamic-model-creation
-        self._usages = {
-            '_help': StringArgConverter('/sub help - 显示此帮助'),
-            '_login': StringArgConverter(
-                '/sub login <username> <password> - 登陆',
-                username=(str,),
-                password=(str,)
-            ),
-            '_search': StringArgConverter(
-                '/sub search <channel> <program> '
-                '[excludeProgram] [detail] [startDate] [startTime] [findFirstMatch] - 搜索节目',
-                channel=(str,),
-                program=(str,),
-                excludeProgram=(str, None),
-                detail=(str, '*'),
-                startDate=(datetime.date, None, cast_date),
-                startTime=(datetime.time, None, cast_time),
-                findFirstMatch=(bool, False, cast_bool_builder(False)),
-            ),
-            '_now': StringArgConverter(
-                '/sub now <channel> <program> '
-                '[excludeProgram] [detail] [startDate] [startTime] [findFirstMatch] - 执行单次订阅任务',
-                channel=(str,),
-                program=(str,),
-                excludeProgram=(str, None),
-                detail=(str, '*'),
-                startDate=(datetime.date, None, cast_date),
-                startTime=(datetime.time, None, cast_time),
-                findFirstMatch=(bool, False, cast_bool_builder(False)),
-            ),
-            '_daily': StringArgConverter(
-                '/sub daily <channel> <program> '
-                '[excludeProgram] [detail] [checkTime] [days] [startTime] - 添加每日定时检查任务',
-                channel=(str,),
-                program=(str,),
-                excludeProgram=(str, None),
-                detail=(str, '*'),
-                checkTime=(datetime.time, lambda: datetime.datetime.now(self.timezone).time(), cast_time),
-                days=(tuple[int],
-                      tuple(range(0, 6+1)),
-                      cast_ints),
-                startTime=(datetime.time, None, cast_time),
-            ),
-            '_userinfo': StringArgConverter('/sub userinfo - 查看当前账户信息'),
-            '_list': StringArgConverter('/sub list - 查看已添加的定时任务'),
-            '_check': StringArgConverter(
-                '/sub check <ids> - 手动触发定时任务',
-                id=(list[int], cast_ints)
-            ),
-            '_edit': StringArgConverter(
-                '/sub edit <id> [channel] [program] '
-                '[excludeProgram] [detail] [checkTime] [days] [startTime] - 修改单个定时任务',
-                id=(int, ),
-                channel=(str, None),
-                program=(str, None),
-                excludeProgram=(str, None),
-                detail=(str, '*'),
-                checkTime=(datetime.time, lambda: datetime.datetime.now(self.timezone).time(), cast_time),
-                days=(tuple[int],
-                      tuple(range(0, 6 + 1)),
-                      cast_ints),
-                startTime=(datetime.time, None, cast_time),
-            ),
-            '_disable': StringArgConverter(
-                '/sub disable <ids> - 禁用一个定时任务',
-                id=(list[int], cast_ints)
-            ),
-            '_enable': StringArgConverter(
-                '/sub enable <ids> - 恢复一个定时任务',
-                id=(list[int], cast_ints)
-            ),
-            '_remove': StringArgConverter(
-                '/sub remove <ids> - 删除一个定时任务',
-                id=(list[int], cast_ints)
-            ),
-            '_start': StringArgConverter('/sub start - 交互式添加定时任务'),
-            '_subscribe': StringArgConverter(
-                '输入id，为单个数字，或多个用","隔开的数字',
-                ids=(list[int], cast_ints)
-            )
-        }
+        debug_handler = MessageHandler(filters.Regex('debug'), self._debug)
+        self._app.add_handler(debug_handler)
 
-    async def _initialize(self, application: DumbApplication):
+        # store handlers created by job, for user removal
+        self._conv_check_daily_jobs: dict[JOB_NAME, ConversationHandler] = {}
+
+        self._callbacks: HandlerCallbacks = HandlerCallbacks()
+
+        self._search_utils = SearchUtils(self._cache)
+
+    # app 相关
+    async def _initialize(self, application: 'Application'):
         # load persisted bot data
         print(application.chat_data)
         print(application.user_data)
         ...
 
-    # public utils
     def listen_forever(self, listen: str = "127.0.0.1", port: int = 18888):
         """Start server"""
         logger.info('listening at {}:{}', listen, port)
-        self._app.run(listen, port)
+        try:
+            self._app.run(listen, port)
+        except pymongo.errors.ServerSelectionTimeoutError:
+            logger.error('无法连接到jobstore！')
 
+    # public utils
     def register_callback(self, func: Callable[[RESULT_TEXT, Chat], Coroutine]) -> Callable[[RESULT_TEXT, Chat], Coroutine]:
         """Register coroutine callback for handling result text, can be used as a decorator."""
-        self._callbacks.append(func)
-        return func
+        return self._callbacks.register_callback(func)
 
     # handlers
-    async def _help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        usages = [usage.text for usage in self._usages.values() if usage.text.startswith('/sub')]
-        await self._notify_handle_result('\n'.join(usages), update)
+    async def _debug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        data={
+             'sid': '1056',
+             'tsid': '32740',
+             'onid': '32740',
+             'eid': '27472',
+             'service': 'フジテレビ',
+             'startdate': '2023/05/14',
+             'starttime': '23:15:00',
+             'timestamp': 1684077300,
+             'week': '0',
+             'week_text': '日',
+             'duration': 30,
+             'event_name': 'テレビアニメ「鬼滅の刃」刀鍛冶の里編[字][解][デ]',
+             'event_text': '第六話『柱になるんじゃないのか！』',
+             'event_ext_text': 'ご案内\n【公式ＨＰ】\nhttps://www.fujitv.co.jp/kimetsu\n番組内容\n＜前回のあらすじ＞\n４体に分裂した半天狗の猛攻に苦戦する炭治郎たち。しかし、禰豆子の血の力により燃えて赤くなった刀を振るい、炭治郎は３体の頸（くび）を同時に斬ることに成功する。玄弥が残りもう一体の鬼の頸を斬っていたことに気づく炭治郎だったが、鬼の頸を持つ玄弥は姿が変わっており……。\n\n第六話『柱になるんじゃないのか！』は５月１４日（日）２３時１５分放送！\n番組内容２\n遊郭での任務を終えた炭治郎たちの次なる物語を描く「刀鍛冶の里編」。炭治郎が向かう先は、刀鍛冶の里。鬼殺隊最強の剣士≪柱≫である、霞柱・時透無一郎と恋柱・甘露寺蜜璃との再会、忍びよる鬼の影。炭治郎たちの新たな戦いが始まる。\n出演者\n竈門炭治郎（かまど・たんじろう）：\u3000花江夏樹\u3000\n竈門禰豆子（かまど・ねずこ）※：\u3000鬼頭明里\u3000\n時透無一郎（ときとう・むいちろう）：\u3000河西健吾\u3000\n甘露寺蜜璃（かんろじ・みつり）：\u3000花澤香菜\u3000\n不死川玄弥（しなずがわ・げんや）：\u3000岡本信彦\u3000\n\n半天狗（はんてんぐ）：\u3000古川登志夫\u3000\n玉壺（ぎょっこ）：\u3000鳥海浩輔\u3000\n\n※禰豆子の「禰」は「ネ＋爾」が正しい表記。\nスタッフ\n【主題歌】\n＜オープニングテーマ＞\nＭＡＮ\u3000ＷＩＴＨ\u3000Ａ\u3000ＭＩＳＳＩＯＮ×ｍｉｌｅｔ\u3000『絆ノ奇跡』\u3000\n＜エンディングテーマ＞\nｍｉｌｅｔ×ＭＡＮ\u3000ＷＩＴＨ\u3000Ａ\u3000ＭＩＳＳＩＯＮ\u3000『コイコガレ』\u3000\n\n【原作】\n吾峠呼世晴（集英社ジャンプ\u3000コミックス刊）\u3000\n【監督】\n外崎春雄\u3000\n【キャラクターデザイン・総作画監督】\n松島晃\u3000\n【脚本制作】\nｕｆｏｔａｂｌｅ\nスタッフ２\n【サブキャラクターデザイン】\n佐藤美幸、梶山庸子、菊池美花\u3000\n【プロップデザイン】\n小山将治\u3000\n【美術監督】\n衛藤功二\u3000\n【撮影監督】\n寺尾優一\u3000\n【３Ｄ監督】\n西脇一樹\u3000\n【色彩設計】\n大前祐子\u3000\n【編集】\n神野学\u3000\n【音楽】\n梶浦由記、椎名豪\u3000\n【アニメーション制作】\nｕｆｏｔａｂｌｅ\u3000\n【製作】\nアニプレックス、集英社、ｕｆｏｔａｂｌｅ\n',
+             'category': 'anime',
+             'resolution': '1080i',
+             'network': 'Kanto',
+             'price': 3.5,
+             'reservetoken': 'f9baeab748ee25d6420521c4f7b0242c'
+         }
+        event = Event(**data)
+        subbed_events: list[Event] = context.user_data.setdefault(KEY_SUBBED_EVENTS, [])
+        subbed_events.append(event)
 
-    async def _login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        usages = [usage.text for usage in self._usages.values()]
+        await self._callbacks.notify_handle_result('\n'.join(usages), update)
+
+    async def _cmd_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/sub login <username> <password>"""
         currfunc = inspect.currentframe().f_code.co_name
         usage = self._usages[currfunc]
         if not usage.check_arg_len(context.args):
-            await self._notify_handle_result(usage.usage, update)
+            await self._callbacks.notify_handle_result(usage.usage, update)
             return
 
         username, password = context.args
@@ -245,37 +248,49 @@ class TVSubscribeBot:
         try:
             res = subscriber.login(username, password)
         except (ApiException, httpx.ConnectError) as e:
-            await self._notify_handle_result(str(e), update)
+            await self._callbacks.notify_handle_result(str(e), update)
             return
         context.user_data['subscriber'] = subscriber
-        context.application.mark_data_for_update_persistence(update.effective_user.id)
-        await self._notify_handle_result(res['information'], update)
+        context.application.mark_data_for_update_persistence(user_ids=update.effective_user.id)
+        await self._callbacks.notify_handle_result(res['information'], update)
 
-    async def _search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # register jobs
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        context.job_queue.run_repeating(
+            callback=JobsManager.job_update_subbed_events,
+            interval=INT_UPDATE_SUBBED_EVENTS,
+            name=JOB_UPDATE_SUBBED_EVENT_PREFIX + str(user_id),
+            chat_id=chat_id,
+            user_id=user_id,
+            job_kwargs=dict(replace_existing=True, id=JOB_UPDATE_SUBBED_EVENT_PREFIX + str(user_id)),
+        )
+
+    async def _cmd_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/sub search <channel> <program> [excludeProgram] [detail] [startDate] [startTime] [findFirstMatch]"""
         # TODO add category?
         currfunc = inspect.currentframe().f_code.co_name
         usage = self._usages[currfunc]
         if not usage.check_arg_len(context.args):
-            await self._notify_handle_result(usage.usage, update)
+            await self._callbacks.notify_handle_result(usage.usage, update)
             return
 
         subscriber: TVSubscriber = context.user_data.get('subscriber')
         if subscriber is None or not subscriber.is_online():
-            await self._notify_handle_result('请先登录！', update)
+            await self._callbacks.notify_handle_result('请(重新)登录！', update)
             return
 
         try:
             channel, program, \
             excludeProgram, detail, startDate, startTime, findFirstMatch = usage.parse_args(context.args)
         except (SyntaxError, TypeError, ValueError) as e:
-            await self._notify_handle_result('参数错误！\n' + str(e), update)
+            await self._callbacks.notify_handle_result('参数错误！\n' + str(e), update)
             return
 
         try:
-            channels = self._find_channels(subscriber, channel)
+            channels = self._search_utils.find_channels(subscriber, channel)
         except (ApiException, httpx.ConnectError) as e:
-            await self._notify_handle_result(str(e), update)
+            await self._callbacks.notify_handle_result(str(e), update)
             return
 
         if len(channels) < 5:
@@ -290,7 +305,7 @@ class TVSubscribeBot:
         try:
             for channel in channels:
                 logger.info('searching ' + channel.service)
-                matches = self._find_programs(
+                matches = self._search_utils.find_programs(
                     subscriber,
                     channel,
                     program,
@@ -305,41 +320,53 @@ class TVSubscribeBot:
                 if len(matches) > 0 and findFirstMatch:
                     break
         except (ApiException, BadResultException) as e:
-            await self._notify_handle_result(str(e), update)
+            await self._callbacks.notify_handle_result(str(e), update)
             return
 
         if len(events) == 0:
-            await self._notify_handle_result('没有找到匹配的节目！', update)
+            await self._callbacks.notify_handle_result('没有找到匹配的节目！', update)
             return
 
-        await self._notify_handle_result(self._make_matched_prompt(events), update)
+        # 标记所有已订阅的节目，防止重复搜索
+        subbed_events: list[Event] = context.user_data.get(KEY_SUBBED_EVENTS, [])
+        # 已订阅的节目仍会显示，且有“已订阅”字样。
+        await self._callbacks.notify_handle_result(
+            self._prompt_matched_events(events, subbed_events),
+            update)
 
-    async def _now(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _cmd_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """/sub now <channel> <program> [excludeProgram] [detail] [startDate] [startTime] [findFirstMatch] - 执行单次订阅任务"""
         # if not match, return END (nomatch), else return NOW_MATCHED
         # TODO add category?
         currfunc = inspect.currentframe().f_code.co_name
         usage = self._usages[currfunc]
         if not usage.check_arg_len(context.args):
-            await self._notify_handle_result(usage.usage, update)
+            await self._callbacks.notify_handle_result(usage.usage, update)
             return self._END
 
         subscriber: TVSubscriber = context.user_data.get('subscriber')
         if subscriber is None or not subscriber.is_online():
-            await self._notify_handle_result('请先登录！', update)
+            await self._callbacks.notify_handle_result('请(重新)登录！', update)
             return self._END
 
+        channelstr: str
+        programstr: str
+        exclude_program: Optional[str]
+        detail: str
+        start_date: Optional[datetime.date]
+        start_time: Optional[datetime.time]
+        find_first_match: bool
         try:
-            channel, program, \
-            excludeProgram, detail, startDate, startTime, findFirstMatch = usage.parse_args(context.args)
+            channelstr, programstr, \
+            exclude_program, detail, start_date, start_time, find_first_match = usage.parse_args(context.args)
         except (SyntaxError, TypeError, ValueError) as e:
-            await self._notify_handle_result('参数错误！\n' + str(e), update)
+            await self._callbacks.notify_handle_result('参数错误！\n' + str(e), update)
             return self._END
 
         try:
-            channels = self._find_channels(subscriber, channel)
+            channels = self._search_utils.find_channels(subscriber, channelstr)
         except (ApiException, httpx.ConnectError) as e:
-            await self._notify_handle_result(str(e), update)
+            await self._callbacks.notify_handle_result(str(e), update)
             return self._END
 
         if len(channels) < 5:
@@ -347,78 +374,616 @@ class TVSubscribeBot:
         else:
             logger.info('matched channels found {}', len(channels))
 
-        if excludeProgram == '':
-            excludeProgram = None
+        if exclude_program == '':
+            exclude_program = None
 
         events = []
         try:
             for channel in channels:
                 logger.info('searching ' + channel.service)
-                matches = self._find_programs(subscriber, channel, program,
-                                              excludeProgram, detail, startDate, startTime, findFirstMatch)
+                matches = self._search_utils.find_programs(
+                    subscriber,
+                    channel,
+                    programstr,
+                    exclude_program,
+                    detail,
+                    start_date,
+                    start_time,
+                    find_first_match
+                )
                 logger.info('matched events found {}', len(matches))
-
                 events.extend(matches)
-                if len(matches) > 0 and findFirstMatch:
+                if len(matches) > 0 and find_first_match:
                     break
         except (ApiException, BadResultException) as e:
-            await self._notify_handle_result(str(e), update)
+            await self._callbacks.notify_handle_result(str(e), update)
             return self._END
 
-        # if len(events) < 5:
-        #     logger.info('total matched events\n' + '\n'.join(str(ev) for ev in events))
-        # else:
         logger.info('total matched events found {}', len(events))
 
+        # 标记所有已订阅的节目，防止重复搜索
+        subbed_events: list[Event] = context.user_data.get(KEY_SUBBED_EVENTS, [])
+        # 已订阅的节目不会显示
+        events = list(filter(lambda ev: ev not in subbed_events, events))
+
+        logger.info('total matched events after filter found {}', len(events))
+
         if len(events) == 0:
-            await self._notify_handle_result('没有找到匹配的节目！', update)
+            await self._callbacks.notify_handle_result('没有找到匹配的节目！', update)
             return self._END
-        _last_matched_events: Dict[EVENT_ID, Event] = context.chat_data.setdefault('_last_matched_events', {})
-        for ind, event in enumerate(events):
-            _last_matched_events[ind + 1] = event
 
-        # TODO 标记所有已订阅的节目
-        await self._notify_handle_result(self._make_matched_prompt(events) + '\n\n' + self._input_ids_prompt(), update)
-        return self._NOW_MATCHED
+        unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.setdefault(KEY_UNHANDLED_MATCHES, {})
+        last_matched_events: EVENT_DICT = unhandled_matches.setdefault(KEY_JOB_NAME_ONCE, {})
+        for i, event in enumerate(events):
+            last_matched_events[i + 1] = event
 
-    async def _watch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        args:
-            channel_keyword: str,
-            program: str,
-            contab='0 10 * * *'
-        """
-        # TODO check is logged in before every op
-        ...
+        context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
 
-    # conversation handlers
-    async def _subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-        """用户回复要订阅哪些。可由单次查询/定时任务触发/手动触发等方式调用。
-        参数为int或 int separated by ','
+        await self._callbacks.notify_handle_result(
+            self._prompt_matched_events(events) + '\n\n' +
+                self._prompt_input_ids_now,
+            update)
+        return self._NOW_MATCHES
+
+    async def _cmd_daily(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sub daily <channel> <program> [excludeProgram] [detail] [checkTime] [days] [startTime] - 添加每日定时检查任务
         """
+        # if not match, return END (nomatch), else return _DAILY_MATCHES
+        # TODO add category?
         currfunc = inspect.currentframe().f_code.co_name
         usage = self._usages[currfunc]
-        args = [match.group() for match in context.matches]
-        if not usage.check_arg_len(args):
-            await self._notify_handle_result(usage.usage, update)
+        if not usage.check_arg_len(context.args):
+            await self._callbacks.notify_handle_result(usage.usage, update)
             return self._END
 
         subscriber: TVSubscriber = context.user_data.get('subscriber')
         if subscriber is None or not subscriber.is_online():
-            await self._notify_handle_result('请先登录！', update)
+            await self._callbacks.notify_handle_result('请(重新)登录！', update)
             return self._END
 
-        _last_matched_events: Dict[EVENT_ID, Optional[Event]] = context.chat_data.get('_last_matched_events')
-        if not _last_matched_events:
-            await self._notify_handle_result('无法获取本次搜索结果！', update)
+        channelstr: str
+        programstr: str
+        exclude_program: Optional[str]
+        detail: str
+        check_time: datetime.time
+        days: tuple[int]
+        start_time: Optional[datetime.time]
+        try:
+            channelstr, programstr, \
+            exclude_program, detail, check_time, days, start_time = usage.parse_args(context.args)
+        except (SyntaxError, TypeError, ValueError) as e:
+            await self._callbacks.notify_handle_result('参数错误！\n' + str(e), update)
+            return self._END
+
+        # first prompt result, add job after user respond
+        try:
+            channels = self._search_utils.find_channels(subscriber, channelstr)
+        except (ApiException, httpx.ConnectError) as e:
+            await self._callbacks.notify_handle_result(str(e), update)
+            return self._END
+
+        if len(channels) < 5:
+            logger.info('matched channels\n' + '\n'.join(str(ch) for ch in channels))
+        else:
+            logger.info('matched channels found {}', len(channels))
+
+        if exclude_program == '':
+            exclude_program = None
+
+        events = []
+        try:
+            for channel in channels:
+                logger.info('searching ' + channel.service)
+                matches = self._search_utils.find_programs(
+                    subscriber,
+                    channel,
+                    programstr,
+                    exclude_program,
+                    detail,
+                    start_date=None,
+                    start_time=start_time,
+                    find_first_match=False
+                )
+                logger.info('matched events found {}', len(matches))
+                events.extend(matches)
+        except (ApiException, BadResultException) as e:
+            await self._callbacks.notify_handle_result(str(e), update)
+            return self._END
+
+        logger.info('total matched events found {}', len(events))
+
+        context.chat_data[KEY_LAST_DAILY_JOB_ARGS] = dict(
+            channelstr=channelstr,
+            programstr=programstr,
+            exclude_program=exclude_program,
+            detail=detail,
+            check_time=check_time,
+            days=days,
+            start_time=start_time,
+        )
+
+        context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
+
+        # 标记所有已订阅的节目，防止重复搜索
+        subbed_events: list[Event] = context.user_data.get(KEY_SUBBED_EVENTS, [])
+        # 已订阅的节目仍会显示，且有“已订阅”字样。
+        await self._callbacks.notify_handle_result(
+            '当前匹配结果：\n' +
+                self._prompt_matched_events(events, subbed_events) +
+                '\n\n' +
+                self._prompt_job_confirm,
+            update)
+        return self._DAILY_MACHES
+
+    async def _cmd_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+        """定时触发/手动触发单个任务检查"""
+        currfunc = inspect.currentframe().f_code.co_name
+        usage = self._usages[currfunc]
+        if not usage.check_arg_len(context.args):
+            await self._callbacks.notify_handle_result(usage.text, update)
+            return self._END
+
+        subscriber: TVSubscriber = context.user_data.get('subscriber')
+        if subscriber is None or not subscriber.is_online():
+            await self._callbacks.notify_handle_result('请(重新)登录！', update)
+            return self._END
+
+        unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.get(KEY_UNHANDLED_MATCHES, {})
+        if len(unhandled_matches) > 0:
+            await self._callbacks.notify_handle_result('请先处理未完成的订阅任务！', update)
+            return self._END
+
+        try:
+            (jobid,) = usage.parse_args(context.args)
+        except (SyntaxError, TypeError, ValueError) as e:
+            await self._callbacks.notify_handle_result(usage.text + '\n' + str(e), update)
+            return self._END
+
+        jobs_mapping: JobsMapping = context.chat_data.get(KEY_JOB_MAPPING, JobsMapping())
+        if (inner_id := jobs_mapping.get_inner_id(jobid)) is None:
+            await self._callbacks.notify_handle_result('找不到jobid' + str(jobid), update)
+            return self._END
+
+        job_name = inner_id
+        try:
+            # get args from job's data
+            job: Job = context.job_queue.get_jobs_by_name(job_name)[0]
+        except IndexError:
+            await self._callbacks.notify_handle_result('找不到job_name' + job_name, update)
+            return self._END
+
+        job.data[JOBKEY_THIS_UPDATE] = update
+
+        daily_job_args = job.data[JOBKEY_DAILY_JOB_ARGS]
+        channelstr: str = daily_job_args['channelstr']
+        programstr: str = daily_job_args['programstr']
+        exclude_program: Optional[str] = daily_job_args['exclude_program']
+        detail: str = daily_job_args['detail']
+        start_time: Optional[datetime.time] = daily_job_args['start_time']
+
+        # prompt result
+        try:
+            channels = self._search_utils.find_channels(subscriber, channelstr)
+        except (ApiException, httpx.ConnectError) as e:
+            await self._callbacks.notify_handle_result(str(e), update)
+            return self._END
+
+        if len(channels) < 5:
+            logger.info('matched channels\n' + '\n'.join(str(ch) for ch in channels))
+        else:
+            logger.info('matched channels found {}', len(channels))
+
+        if exclude_program == '':
+            exclude_program = None
+
+        events = []
+        try:
+            for channel in channels:
+                logger.info('searching ' + channel.service)
+                matches = self._search_utils.find_programs(
+                    subscriber,
+                    channel,
+                    programstr,
+                    exclude_program,
+                    detail,
+                    start_date=None,
+                    start_time=start_time,
+                    find_first_match=False
+                )
+                logger.info('matched events found {}', len(matches))
+
+                events.extend(matches)
+        except (ApiException, BadResultException) as e:
+            await self._callbacks.notify_handle_result(str(e), update)
+            return self._END
+
+        logger.info('total matched events found {}', len(events))
+
+        # 标记所有已订阅的节目，防止重复搜索
+        subbed_events: list[Event] = context.user_data.get(KEY_SUBBED_EVENTS, [])
+        # 已订阅的节目不会显示
+        events = list(filter(lambda ev: ev not in subbed_events, events))
+
+        logger.info('total matched events after filter found {}', len(events))
+
+        if len(events) == 0:
+            await self._callbacks.notify_handle_result('定时任务jobid: ' + str(jobid) + ' 没有找到匹配的节目！', update)
+            return self._END
+
+        unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.setdefault(KEY_UNHANDLED_MATCHES, {})
+        last_matched_events: EVENT_DICT = unhandled_matches.setdefault(inner_id, {})
+        for i, event in enumerate(events):
+            last_matched_events[i + 1] = event
+
+        context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
+
+        await self._callbacks.notify_handle_result(
+            'jobid: ' + str(jobid) +
+                self._prompt_matched_events(events) + '\n\n' +
+                self._prompt_input_ids_daily_job,
+            update)
+        return self._CHECK_DAILY_JOB_MACHES
+
+    async def _cmd_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sub list - 查看已添加的定时任务"""
+        jobs_mapping: JobsMapping = context.chat_data.get(KEY_JOB_MAPPING, JobsMapping())
+        if len(jobs_mapping) == 0:
+            await self._callbacks.notify_handle_result('无定时任务', update)
+            return
+
+        msgs = []
+        for jobid, job_name in jobs_mapping.items():
+            try:
+                job = context.job_queue.get_jobs_by_name(job_name)[0]
+            except IndexError:
+                continue
+            jobmsg = self._prompt_job_info(
+                jobid=jobid,
+                enabled=True,
+                **job.data[JOBKEY_DAILY_JOB_ARGS]
+            )
+            msgs.append(jobmsg)
+        await self._callbacks.notify_handle_result('\n\n'.join(msgs), update)
+
+    async def _cmd_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sub edit <jobid> [channel] [program] '
+            #     '[excludeProgram] [detail] [checkTime] [days] [startTime] - 修改单个定时任务"""
+        ...
+
+    async def _cmd_disable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sub disable <jobids> - 禁用(多个)定时任务"""
+        ...
+
+    async def _cmd_enable(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sub enable <jobids> - 恢复(多个)定时任务"""
+        ...
+
+    async def _cmd_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sub remove <jobids> - 删除(多个)定时任务"""
+        currfunc = inspect.currentframe().f_code.co_name
+        usage = self._usages[currfunc]
+        if not usage.check_arg_len(context.args):
+            await self._callbacks.notify_handle_result(usage.text, update)
+            return self._END
+
+        # 避免删除正在执行的会话，先处理完所有定时任务
+        unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.get(KEY_UNHANDLED_MATCHES, {})
+        if len(unhandled_matches) > 0:
+            await self._callbacks.notify_handle_result('请先处理未完成的订阅任务！', update)
+            return self._END
+
+        try:
+            jobids: list[int]
+            (jobids,) = usage.parse_args(context.args)
+        except (SyntaxError, TypeError, ValueError) as e:
+            await self._callbacks.notify_handle_result(usage.text + '\n' + str(e), update)
+            return self._END
+
+        jobs_mapping: JobsMapping = context.chat_data.get(KEY_JOB_MAPPING, JobsMapping())
+        retmsg = []
+        for jobid in jobids:
+            msg = 'jobid ' + str(jobid) + ': '
+            if (inner_id := jobs_mapping.get_inner_id(jobid)) is None:
+                msg += '删除失败，找不到jobid'
+            else:
+                job_name = inner_id
+                jobs = context.job_queue.get_jobs_by_name(job_name)
+                if len(jobs) == 0:
+                    msg += '删除失败，job_queue中找不到job_name' + job_name
+                else:
+                    # remove job
+                    try:
+                        jobs[0].schedule_removal()
+                        # remove handler
+                        try:
+                            handler = self._conv_check_daily_jobs.pop(job_name)
+                            context.application.remove_handler(handler)
+                        except KeyError:
+                            pass
+                        # remove from jobs mapping
+                        jobs_mapping.remove_by_inner(job_name)
+                        msg += '删除成功'
+                    except Exception as e:
+                        msg += '删除失败，' + str(e)
+            retmsg.append(msg)
+
+        retmsg = '\n'.join(retmsg)
+        await self._callbacks.notify_handle_result(retmsg, update)
+
+    async def _cmd_userinfo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sub userinfo - 查看当前账户信息"""
+        subscriber: TVSubscriber = context.user_data.get('subscriber')
+        if subscriber is None or not subscriber.is_online():
+            await self._callbacks.notify_handle_result('请(重新)登录！', update)
+            return self._END
+
+        userinfo = subscriber.get_userinfo()
+        retmsgs = (
+            '用户名：' + userinfo.username,
+            '邮箱：' + userinfo.email,
+            '余额：' + userinfo.wallet,
+        )
+        retmsg = '\n'.join(retmsgs)
+        await self._callbacks.notify_handle_result(retmsg, update)
+
+    # conversation handler callbacks
+    async def _callback_subscribe_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+        """用户回复要订阅哪些。对应单次查询。
+        参数为int或 int separated by ','
+        """
+        currfunc = inspect.currentframe().f_code.co_name
+        usage = self._usages_private[currfunc]
+        args = [match.group() for match in context.matches]
+        if not usage.check_arg_len(args):
+            await self._callbacks.notify_handle_result(usage.text, update)
+            return self._END
+
+        subscriber: TVSubscriber = context.user_data.get('subscriber')
+        if subscriber is None or not subscriber.is_online():
+            await self._callbacks.notify_handle_result('请(重新)登录！', update)
+            return self._END
+
+        unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.get(KEY_UNHANDLED_MATCHES, {})
+
+        last_matched_events: EVENT_DICT = unhandled_matches.get(KEY_JOB_NAME_ONCE)
+        if not last_matched_events:
+            await self._callbacks.notify_handle_result('无法获取本次搜索结果！', update)
             return self._END
 
         try:
             (ids,) = usage.parse_args(args)
-            assert all(0 <= id <= len(_last_matched_events) for id in ids)
+            assert all(0 <= id <= len(last_matched_events) for id in ids)
         except (AssertionError, SyntaxError, TypeError, ValueError) as e:
-            await self._notify_handle_result('序号错误，请重新输入！\n' + str(e), update)
+            await self._callbacks.notify_handle_result('序号错误，请重新输入！\n' + str(e), update)
             return
+
+        successed_ids, failed_ids, already_subbed_ids, result_text = self._util_subscribe(ids, last_matched_events, subscriber)
+
+        # 已预约过的视为预约成功
+        successed_ids.extend(already_subbed_ids)
+
+        if successed_ids:
+            subbed_events: list[Event] = context.user_data.setdefault(KEY_SUBBED_EVENTS, [])
+            subbed_events.extend(last_matched_events[id] for id in successed_ids)
+            # mark event if success
+            for id in successed_ids:
+                last_matched_events[id] = None
+            context.application.mark_data_for_update_persistence(
+                chat_ids=update.effective_chat.id,
+                user_ids=update.effective_user.id,
+            )
+
+        if failed_ids:
+            # stay in current state if any failed
+            return
+
+        # clear data if all success (or cancled)
+        unhandled_matches.pop(KEY_JOB_NAME_ONCE)
+
+        await self._callbacks.notify_handle_result(result_text, update)
+
+        return self._END
+
+    async def _callback_subscribe_daily_job(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+        """用户回复要订阅哪些。对应定时任务触发/手动触发。
+        参数为int或 int separated by ',' 和 jobid
+        """
+        # 如果只有一个触发任务，则直接输入订阅序号，否则需要输入jobid和序号。
+        currfunc = inspect.currentframe().f_code.co_name
+        usage = self._usages_private[currfunc]
+        args = context.match.groups()  # only retrieve those in brackets
+        if not usage.check_arg_len(args):
+            await self._callbacks.notify_handle_result(usage.usage, update)
+            return self._END
+
+        subscriber: TVSubscriber = context.user_data.get('subscriber')
+        if subscriber is None or not subscriber.is_online():
+            await self._callbacks.notify_handle_result('请(重新)登录！', update)
+            return self._END
+
+        unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.get(KEY_UNHANDLED_MATCHES, {})
+        jobs_mapping: JobsMapping = context.chat_data.get(KEY_JOB_MAPPING, JobsMapping())
+        try:
+            # 检查未处理list是否只有一个，有多个则提示需要输入jobid。
+            ids, outer_id = usage.parse_args(args)
+            if outer_id is None:
+                if len(unhandled_matches) > 1:
+                    await self._callbacks.notify_handle_result('有多个待处理结果，请输入jobid！', update)
+                    return
+                outer_id = jobs_mapping.get_any_outer_id()
+
+            inner_id = jobs_mapping.get_inner_id(outer_id)
+            last_matched_events: EVENT_DICT = unhandled_matches.get(inner_id)
+            if outer_id is None or inner_id is None or not last_matched_events:
+                await self._callbacks.notify_handle_result('无法获取jobid' + str(outer_id) + '的搜索结果！', update)
+                return self._END
+            assert all(0 <= id <= len(last_matched_events) for id in ids)
+        except (AssertionError, SyntaxError, TypeError, ValueError) as e:
+            await self._callbacks.notify_handle_result('参数错误，请重新输入！\n' + str(e), update)
+            return
+
+        successed_ids, failed_ids, already_subbed_ids, result_text = self._util_subscribe(ids, last_matched_events, subscriber)
+
+        # 已预约过的视为预约成功
+        successed_ids.extend(already_subbed_ids)
+
+        if successed_ids:
+            subbed_events: list[Event] = context.user_data.setdefault(KEY_SUBBED_EVENTS, [])
+            subbed_events.extend(last_matched_events[id] for id in successed_ids)
+            # mark event if success
+            for id in successed_ids:
+                last_matched_events[id] = None
+            context.application.mark_data_for_update_persistence(
+                chat_ids=update.effective_chat.id,
+                user_ids=update.effective_user.id,
+            )
+
+        if failed_ids:
+            # stay in current state if any failed
+            return
+
+        # clear data if all success
+        unhandled_matches.pop(inner_id)
+
+        await self._callbacks.notify_handle_result(result_text, update)
+
+        return self._END
+
+    async def _daily_job_confirmed(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+        # 是否添加任务？(是/否)
+        if update.effective_message.text == '否':
+            await self._callbacks.notify_handle_result('已取消', update)
+            context.chat_data.pop(KEY_LAST_DAILY_JOB_ARGS)
+            return self._END
+
+        try:
+            last_daily_job_args = context.chat_data.get(KEY_LAST_DAILY_JOB_ARGS, {})
+            for key in ['channelstr', 'programstr', 'exclude_program', 'detail', 'check_time', 'days', 'start_time']:
+                assert key in last_daily_job_args
+        except AssertionError as e:
+            await self._callbacks.notify_handle_result('无法获取用户定时任务参数！\n' + str(e), update)
+            return self._END
+
+        context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
+        job_name = uuid4().hex
+        jobs_mapping = context.chat_data.setdefault(KEY_JOB_MAPPING, JobsMapping())
+        jobs_mapping.insert(job_name)
+        outer_id = jobs_mapping.get_outer_id(job_name)
+        # 为避免多个job同时触发的时候解决handle冲突，入口指令添加 job_name
+        # 一个job只需要一个handler反复用即可，触发多次则新的进度覆盖旧的
+        conv_check_daily_job = ConversationHandler(
+            allow_reentry=True,  # 如果同一个job连续触发多次，允许覆盖掉旧的
+            entry_points=[
+                ChainCommandHandler(
+                    '/checkdailyjob' + job_name,
+                    callback=self._cmd_check)
+            ],
+            states={
+                self._CHECK_DAILY_JOB_MACHES: [
+                    MessageHandler(filters.Regex(fr'(^[\d,]+)(?: ({outer_id}))?$'), self._callback_subscribe_daily_job)
+                ]
+            },
+            fallbacks=[
+                MessageHandler(filters.Regex(fr'^/sub cancel(?: ({outer_id}))?$'), self._cancel_conversation),
+                MessageHandler(filters.ALL, self._prompt_resend),
+            ],
+            persistent=True,
+            name=job_name,
+        )
+        # store conv handler for future removal
+        self._conv_check_daily_jobs[conv_check_daily_job.name] = conv_check_daily_job
+        check_time: datetime.time = last_daily_job_args.get('check_time')
+        days: tuple[int] = last_daily_job_args.get('days')
+
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        job: Job = context.job_queue.run_daily(
+            callback=JobsManager.job_check_daily,
+            time=check_time,
+            days=days,
+            data={
+                JOBKEY_DAILY_JOB_ARGS: last_daily_job_args,
+                JOBKEY_THIS_UPDATE: update,
+            },
+            name=job_name,
+            chat_id=chat_id,
+            user_id=user_id,
+            job_kwargs=dict(replace_existing=True, id=job_name),
+        )
+        context.application.add_handler(conv_check_daily_job)
+
+        context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
+        jobid = jobs_mapping.get_outer_id(job.name)
+        await self._callbacks.notify_handle_result(
+            '已添加，jobid: ' +
+                str(jobid),
+            update)
+        context.chat_data.pop(KEY_LAST_DAILY_JOB_ARGS)
+        return self._END
+
+    # conversation state commands
+    async def _cancel_interactive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        ...
+
+    async def _cancel_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+        # 退出会话、删除所在会话的匹配结果
+        # 考虑如果没输jobid，而有多个unhandled matches的情况
+        unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.get(KEY_UNHANDLED_MATCHES, {})
+        if len(unhandled_matches) == 0:
+            # nothing to cancel, maybe 'daily'. just end conversation.
+            await self._callbacks.notify_handle_result(
+                '已终止会话', update)
+            return self._END
+
+        jobs_mapping: JobsMapping = context.chat_data.get(KEY_JOB_MAPPING, JobsMapping())
+        suffix = context.match.group(1)
+        if suffix is None:
+            # does not have suffix jobid, 'daily' or 'now'
+            if len(unhandled_matches) > 1:
+                await self._callbacks.notify_handle_result('有多个待处理结果，请指定要取消的任务！\n参数为：<jobid>、now、daily', update)
+                return
+            else:
+                # cancels now or jobid
+                job_name = list(unhandled_matches.keys())[0]
+                suffix = 'now' if job_name == KEY_JOB_NAME_ONCE else str(jobs_mapping.get_outer_id(job_name, ''))
+
+        if not suffix:
+            # suffix is empty. not likely but in case for robustness
+            pass
+        elif suffix == 'now':
+            # cancels cmd 'now'
+            try:
+                unhandled_matches.pop(KEY_JOB_NAME_ONCE)
+                context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
+            except KeyError:
+                pass
+        else:
+            # cancels daily job with jobid
+            jobid = int(suffix)
+            job_name = jobs_mapping.get_inner_id(jobid)
+
+            # make sure user input jobid is valid
+            try:
+                assert job_name is not None
+                unhandled_matches.pop(job_name)
+                context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
+            except (AssertionError, KeyError):
+                await self._callbacks.notify_handle_result(self._prompt_jobid_not_found(suffix), update)
+                return
+
+        await self._callbacks.notify_handle_result('已终止会话' + (('jobid ' + suffix) if suffix.isdigit() else suffix if suffix else ''), update)
+        return self._END
+
+    async def _prompt_resend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._callbacks.notify_handle_result('输入错误，请重新输入或取消会话', update)
+
+    # private utils
+    def _util_subscribe(
+        self,
+        ids: list[int],
+        last_matched_events: EVENT_DICT,
+        subscriber: TVSubscriber
+    ) -> tuple[SUCCESSED_IDS, FAILED_IDS, ALREADY_SUBBED_IDS, RESULT_TEXT]:
         if any(id == 0 for id in ids):
             ids = [0]
         else:
@@ -428,25 +993,30 @@ class TVSubscribeBot:
         should_sub_all = ids[0] == 0
         reservations = []
         successed_ids = []
+        already_subbed_ids = []
         failed_ids = []
         errors = []
+        # last_matched_events 不包含本次之前已订阅的节目
         if should_sub_all:
-            avail_events = _last_matched_events
+            avail_events = last_matched_events
         else:
             # 根据用户输入序号筛选
-            avail_events = {id: _last_matched_events[id] for id in ids}
+            avail_events = {id: last_matched_events[id] for id in ids}
 
         for id, event in avail_events.items():
             if event is None:
-                # this is a previously successfully subscribed event
+                # this is a successfully subscribed event
                 continue
             try:
                 reservation = self._do_subscribe(subscriber, event)
                 reservations.append(reservation)
                 successed_ids.append(id)
             except (ApiException, httpx.ConnectError) as e:
-                failed_ids.append(id)
-                errors.append(str(e))
+                if '已经预约过' in str(e):
+                    already_subbed_ids.append(id)
+                else:
+                    failed_ids.append(id)
+                    errors.append(str(e))
 
         try:
             userinfo = subscriber.get_userinfo()
@@ -456,119 +1026,73 @@ class TVSubscribeBot:
 
         if successed_ids:
             result_text += '预约成功：' + ', '.join(map(str, successed_ids)) + '\n'
-            # remove event if success
-            for id in successed_ids:
-                _last_matched_events[id] = None
+
+        if already_subbed_ids:
+            result_text += '已预约过：' + ', '.join(map(str, already_subbed_ids)) + '\n'
 
         if failed_ids:
             # 如果有失败，可再次输入需要重新预约的序号
-            result_text += '预约失败：' + ', '.join(f'{id}（{e}）' for id, e in zip(failed_ids, errors)) + '\n' + self._input_ids_prompt() + '\n（成功的节目将被跳过。）'
+            result_text += '预约失败：' + ', '.join(
+                f'{id}（{e}）' for id, e in
+                zip(failed_ids, errors)) + '\n' + self._prompt_input_ids_now + '\n（成功的节目将被跳过。）'
 
-        await self._notify_handle_result(result_text, update)
+        return successed_ids, failed_ids, already_subbed_ids, result_text
 
-        if failed_ids:
-            # stay in current state if any failed
-            return
-        # clear data if all success
-        context.chat_data.pop('_last_matched_events')
-        return self._END
-
-    # conversation state commands
-    async def _cancel_interactive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        ...
-
-    async def _cancel_subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        # 退出会话、删除上次的匹配结果、
-        context.chat_data.pop('_last_matched_events')
-        await self._notify_handle_result('已终止', update)
-        return self._END
-
-    async def _resend_input_ids_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._notify_handle_result('输入错误！' + self._input_ids_prompt(), update)
-        return self._NOW_MATCHED
-
-    # private utils
     @staticmethod
     def _do_subscribe(subscriber: TVSubscriber, program: Event) -> Reservation:
         return subscriber.subscribe(program.sid, program.eid, program.tsid, program.onid, program.price, program.network, program.reservetoken)
 
-    def _find_channels(self, subscriber: TVSubscriber, keyword: str) -> list[Channel]:
-        """
-        Only look up cache, need to manually refresh if result is not desired.
+    # prompts
+    @property
+    def _prompt_input_ids_now(self) -> str:
+        return (
+            "请输入需要订阅的序号，0表示全选，多个序号必须用英文逗号','隔开。\n"
+            "输入/sub cancel或/sub cancel now终止订阅。"
+        )
 
-        注意catch ApiException
-        """
-        # / around keyword (after stripping quotations) means word boundary
-        keyword = keyword.replace('*', '%').replace('?', '_')
-        matches = self._cache.find_channels(keyword)
+    @property
+    def _prompt_input_ids_daily_job(self) -> str:
+        return (
+            "请输入需要订阅的序号和jobid，二者用空格隔开，如1,2 1\n" 
+            "序号可以用0表示全选，多个序号必须用英文逗号','隔开。\n" 
+            "如果只有一个未处理定时任务则可省略jobid\n" 
+            "输入/sub cancel或/sub cancel <jobid>取消本次订阅。"
+        )
 
-        if len(matches) == 0:
-            # cache miss
-            logger.info('cache miss! Please manually refresh if needed.')
-            # channel keyword not exist
-            # return []
-            # TODO change to cache only.
-            self._refresh_channel_cache(subscriber)
-            matches = self._cache.find_channels(keyword)
-        else:
-            logger.info('cache hit!')
+    @property
+    def _prompt_job_confirm(self) -> str:
+        return (
+            '是否添加任务？（是/否）\n'
+            '输入/sub cancel或/sub cancel <jobid>终止此会话。'
+        )
 
-        # found matched channels, update their epgtoken
-        logger.info('updating epgtoken')
-        self._update_epgtoken(subscriber, matches)
-        return matches
+    def _prompt_jobid_not_found(self, jobid: str) -> str:
+        return '找不到jobid: ' + jobid
 
-    def _find_programs(
-        self,
-        subscriber: TVSubscriber,
-        channel: Channel,
-        program: str,
-        excludeProgram: Optional[str],
-        detail: str,
-        startDate: Optional[datetime.date],
-        startTime: Optional[datetime.time],
-        findFirstMatch: bool,
-    ) -> list[Event]:
-        """
-        注意catch ApiException
-        """
-        # TODO this is time consuming, change to cache.
-        #  if cache, no BadResultException is need.
-        events = subscriber.get_epgs(channel.sid, channel.network, channel.epgtoken, channel.tsid, timeout=None)
-        try:
-            assert len(events) > 0, f'{channel.service}的节目列表为空！'
-        except AssertionError as e:
-            raise BadResultException(e)
-
-        # search strings
-        pat_program = self._make_pattern(convertline(program))
-        pat_exclude_program = self._make_pattern(convertline(excludeProgram)) if isinstance(excludeProgram, str) else None
-        pat_detail = self._make_pattern(convertline(detail))
-
-        matches = []
-        for i, event in enumerate(events):
-            if (
-                pat_program.search(convertline(event.event_name)) and
-                pat_detail.search(convertline(event.event_text + '\n' + event.event_ext_text)) and
-                (pat_exclude_program is None or not pat_exclude_program.search(convertline(event.event_name))) and
-                (not isinstance(startDate, datetime.date) or startDate == event.startdate) and
-                (not isinstance(startTime, datetime.time) or startTime == event.starttime)
-            ):
-                matches.append(event)
-                if findFirstMatch:
-                    break
-        return matches
+    def _prompt_job_info(self, **kwargs) -> str:
+        items = []
+        for key, val in kwargs.items():
+            if key == 'enabled':
+                val = '已启用' if val else '已禁用'
+            elif key == 'check_time':
+                val = val.strftime('%H:%M:%S')
+            elif key == 'start_time':
+                val = val.strftime('%H:%M:%S') if val else '无'
+            elif key == 'exclude_program':
+                val = '' if val is None else val
+            else:
+                val = str(val)
+            items.append(': '.join((key, val)))
+        return '\n'.join(items)
 
     @staticmethod
-    def _input_ids_prompt() -> str:
-        return "请输入需要订阅的序号，0表示全选，多个序号必须用英文逗号','隔开。\n输入/sub cancel终止订阅。"
-
-    @staticmethod
-    def _make_matched_prompt(events: List[Event]) -> str:
-        """提示匹配到的节目，并询问用户订阅哪些。
-        :param ask_input: 是否询问用户需要订阅哪些。
+    def _prompt_matched_events(
+        events: List[Event],
+        subbed_events_for_hint: Optional[List[Event]] = None,
+    ) -> str:
+        """提示匹配到的节目
         """
-        msgs = [['共找到' + str(len(events)) + '个结果']]
+        msgs = ['共找到' + str(len(events)) + '个结果']
         for i, event in enumerate(events):
             msg = [
                 '序号：' + str(i+1),
@@ -581,50 +1105,104 @@ class TVSubscribeBot:
                 '价格：' + str(event.price) + '元',
                 '分辨率：' + event.resolution,
             ]
-            msgs.append(msg)
+            if subbed_events_for_hint is not None and events in subbed_events_for_hint:
+                msg = ['【已订阅】'] + msg
+            msgs.append('\n'.join(msg))
 
-        return '\n\n'.join('\n'.join(msg) for msg in msgs)
-
-    @staticmethod
-    def _make_pattern(keyword: str) -> re.Pattern:
-        """把'*代表任意字符，?代表单个字符'的匹配规则替换为正则表达式"""
-        keyword = re.escape(keyword)
-        keyword = keyword.replace(r'\*', '.*').replace(r'\?', '.')
-        return re.compile(keyword)
-
-    def _refresh_channel_cache(self, subscriber: TVSubscriber):
-        self._cache.refresh_table()
-        channels = []
-        for network in NETWORK_NAMES.keys():
-            channels.extend(subscriber.get_channels(network))
-        self._cache.insert_channels(channels)
-
-    async def _notify_handle_result(self, text: RESULT_TEXT, update: Update):
-        for callback in self._callbacks:
-            await callback(text, update.effective_chat)
+        return '\n\n'.join(msgs)
 
     def _show_sub_result(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ...
         return self._END
 
-    @staticmethod
-    def _update_epgtoken(subscriber: TVSubscriber, target_channels: List[Channel]):
-        targets: Dict[NETWORKS, List[Channel]] = {}
-        for target_channel in target_channels:
-            # note: 不能用频道名作为索引，因为频道名不唯一
-            # 按network把target_channel分组
-            targets.setdefault(target_channel.network, []).append(target_channel)
+    @property
+    def _usages(self):
+        #  https://docs.pydantic.dev/latest/usage/models/#dynamic-model-creation
+        return {
+            '_cmd_help': StringArgConverter('/sub help - 显示此帮助'),
+            '_cmd_login': StringArgConverter(
+                '/sub login <username> <password> - 登陆',
+                username=(str,),
+                password=(str,)
+            ),
+            '_cmd_search': StringArgConverter(
+                '/sub search <channel> <program> '
+                '[excludeProgram] [detail] [startDate] [startTime] [findFirstMatch] - 搜索节目',
+                channel=(str,),
+                program=(str,),
+                excludeProgram=(str, None),
+                detail=(str, '*'),
+                startDate=(datetime.date, None, cast_date),  # None表示不限制
+                startTime=(datetime.time, None, cast_time_jp),  # None表示不限制
+                findFirstMatch=(bool, False, cast_bool_builder(False)),
+            ),
+            '_cmd_now': StringArgConverter(
+                '/sub now <channel> <program> '
+                '[excludeProgram] [detail] [startDate] [startTime] [findFirstMatch] - 执行单次订阅任务',
+                channel=(str,),
+                program=(str,),
+                excludeProgram=(str, None),
+                detail=(str, '*'),
+                startDate=(datetime.date, None, cast_date),
+                startTime=(datetime.time, None, cast_time_jp),
+                findFirstMatch=(bool, False, cast_bool_builder(False)),
+            ),
+            '_cmd_daily': StringArgConverter(
+                '/sub daily <channel> <program> '
+                '[excludeProgram] [detail] [checkTime] [days] [startTime] - 添加每日定时检查任务',
+                channel=(str,),
+                program=(str,),
+                excludeProgram=(str, None),
+                detail=(str, '*'),
+                checkTime=(datetime.time, datetime.datetime.now(pytz.timezone('Asia/Shanghai')).time, cast_time_cn),
+                days=(tuple[int],
+                      tuple(range(0, 6 + 1)),
+                      cast_ints),
+                startTime=(datetime.time, None, cast_time_jp),
+            ),
+            '_cmd_check': StringArgConverter(
+                '/sub check <jobid> - 手动触发单个定时任务',
+                jobid=(int,)
+            ),
+            '_cmd_userinfo': StringArgConverter('/sub userinfo - 查看当前账户信息'),
+            '_cmd_list': StringArgConverter('/sub list - 查看已添加的定时任务'),
+            # '_cmd_edit': StringArgConverter(
+            #     '/sub edit <jobid> [channel] [program] '
+            #     '[excludeProgram] [detail] [checkTime] [days] [startTime] - 修改单个定时任务',
+            #     jobid=(int,),
+            #     channel=(str, None),
+            #     program=(str, None),
+            #     excludeProgram=(str, None),
+            #     detail=(str, '*'),
+            #     checkTime=(datetime.time, None, cast_time_cn),  # 注意None表示不改变原值
+            #     days=(tuple[int], None, cast_ints),
+            #     startTime=(datetime.time, None, cast_time_jp),
+            # ),
+            # '_cmd_disable': StringArgConverter(
+            #     '/sub disable <jobids> - 禁用(多个)定时任务',
+            #     jobids=(list[int], cast_ints)
+            # ),
+            # '_cmd_enable': StringArgConverter(
+            #     '/sub enable <jobids> - 恢复(多个)定时任务',
+            #     jobids=(list[int], cast_ints)
+            # ),
+            '_cmd_remove': StringArgConverter(
+                '/sub remove <jobids> - 删除(多个)定时任务',
+                jobids=(list[int], cast_ints)
+            ),
+            # '_cmd_start': StringArgConverter('/sub start - 交互式添加定时任务'),
+        }
 
-        for network, target in targets.items():
-            seen = []
-            target_len = len(target)
-            for channel in subscriber.get_channels(network):
-                # 比较方式是除了epgtoken外其他都相同
-                try:
-                    target_channel = target.pop(target.index(channel))
-                except ValueError:
-                    continue
-                target_channel.epgtoken = channel.epgtoken
-                seen.append(target_channel)
-                if len(seen) == target_len:
-                    break
+    @property
+    def _usages_private(self):
+        return {
+            '_subscribe_now': StringArgConverter(
+                '输入序号，为单个数字，或多个用","隔开的数字',
+                ids=(list[int], cast_ints)
+            ),
+            '_subscribe_daily_job': StringArgConverter(
+                '输入"序号 jobid"，序号为单个数字，或多个用","隔开的数字，jobid为单个数字',
+                ids=(list[int], cast_ints),
+                jobid=(int, None)
+            ),
+        }
