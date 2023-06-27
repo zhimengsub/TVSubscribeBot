@@ -302,9 +302,9 @@ class TVSubscribeBot:
             excludeProgram = None
 
         events = []
-        try:
-            for channel in channels:
-                logger.info('searching ' + channel.service)
+        for channel in channels:
+            logger.info('searching ' + channel.service)
+            try:
                 matches = self._search_utils.find_programs(
                     subscriber,
                     channel,
@@ -315,13 +315,13 @@ class TVSubscribeBot:
                     startTime,
                     findFirstMatch
                 )
-                logger.info('matched events found {}', len(matches))
-                events.extend(matches)
-                if len(matches) > 0 and findFirstMatch:
-                    break
-        except (ApiException, BadResultException) as e:
-            await self._callbacks.notify_handle_result(str(e), update)
-            return
+            except (ApiException, BadResultException) as e:
+                await self._callbacks.notify_handle_result(str(e), update)
+                continue
+            logger.info('matched events found {}', len(matches))
+            events.extend(matches)
+            if len(matches) > 0 and findFirstMatch:
+                break
 
         if len(events) == 0:
             await self._callbacks.notify_handle_result('没有找到匹配的节目！', update)
@@ -378,9 +378,9 @@ class TVSubscribeBot:
             exclude_program = None
 
         events = []
-        try:
-            for channel in channels:
-                logger.info('searching ' + channel.service)
+        for channel in channels:
+            logger.info('searching ' + channel.service)
+            try:
                 matches = self._search_utils.find_programs(
                     subscriber,
                     channel,
@@ -391,13 +391,13 @@ class TVSubscribeBot:
                     start_time,
                     find_first_match
                 )
-                logger.info('matched events found {}', len(matches))
-                events.extend(matches)
-                if len(matches) > 0 and find_first_match:
-                    break
-        except (ApiException, BadResultException) as e:
-            await self._callbacks.notify_handle_result(str(e), update)
-            return self._END
+            except (ApiException, BadResultException) as e:
+                await self._callbacks.notify_handle_result(str(e), update)
+                continue
+            logger.info('matched events found {}', len(matches))
+            events.extend(matches)
+            if len(matches) > 0 and find_first_match:
+                break
 
         logger.info('total matched events found {}', len(events))
 
@@ -471,9 +471,9 @@ class TVSubscribeBot:
             exclude_program = None
 
         events = []
-        try:
-            for channel in channels:
-                logger.info('searching ' + channel.service)
+        for channel in channels:
+            logger.info('searching ' + channel.service)
+            try:
                 matches = self._search_utils.find_programs(
                     subscriber,
                     channel,
@@ -484,11 +484,11 @@ class TVSubscribeBot:
                     start_time=start_time,
                     find_first_match=False
                 )
-                logger.info('matched events found {}', len(matches))
-                events.extend(matches)
-        except (ApiException, BadResultException) as e:
-            await self._callbacks.notify_handle_result(str(e), update)
-            return self._END
+            except (ApiException, BadResultException) as e:
+                await self._callbacks.notify_handle_result(str(e), update)
+                continue
+            logger.info('matched events found {}', len(matches))
+            events.extend(matches)
 
         logger.info('total matched events found {}', len(events))
 
@@ -577,9 +577,9 @@ class TVSubscribeBot:
             exclude_program = None
 
         events = []
-        try:
-            for channel in channels:
-                logger.info('searching ' + channel.service)
+        for channel in channels:
+            logger.info('searching ' + channel.service)
+            try:
                 matches = self._search_utils.find_programs(
                     subscriber,
                     channel,
@@ -590,12 +590,11 @@ class TVSubscribeBot:
                     start_time=start_time,
                     find_first_match=False
                 )
-                logger.info('matched events found {}', len(matches))
-
-                events.extend(matches)
-        except (ApiException, BadResultException) as e:
-            await self._callbacks.notify_handle_result(str(e), update)
-            return self._END
+            except (ApiException, BadResultException) as e:
+                await self._callbacks.notify_handle_result(str(e), update)
+                continue
+            logger.info('matched events found {}', len(matches))
+            events.extend(matches)
 
         logger.info('total matched events found {}', len(events))
 
