@@ -7,7 +7,7 @@ from uuid import uuid4
 import httpx
 import pymongo.errors
 from loguru import logger
-from ptbcontrib.ptb_jobstores import PTBMongoDBJobStore
+from dumbbot.ptbcontrib.ptbcontrib.ptb_jobstores import PTBMongoDBJobStore
 from telegram.ext import Job
 
 from dumb_bot.dumbbot import DumbApplication, DumbBot, Chat
