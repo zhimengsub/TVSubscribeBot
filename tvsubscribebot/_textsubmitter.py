@@ -1,5 +1,4 @@
 import random
-import pytz
 
 from dumb_bot.dumbbot import Message, UpdateGenerator, User, Chat
 from tvsubscribebot.utils.casts import *
