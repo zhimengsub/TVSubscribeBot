@@ -3,6 +3,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 DB_CACHE = ROOT / 'data' / 'cache.db'
+DB_CACHE.parent.mkdir(exist_ok=True)
 
 DB_JOBSTORE = 'mongodb://127.0.0.1:27017/admin?retryWrites=true&w=majority'
 

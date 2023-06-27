@@ -57,8 +57,8 @@ class CacheManager:
         #! epgtoken可能会随时间变化，导致cache失效，故不保存
         self.connect()
         self.c.execute('DROP TABLE IF EXISTS channels')
-        self.create_table_channels()
         self.conn.commit()
+        self.create_table_channels()
         self.close()
 
     def insert_channels(self, channels: list[Channel]):
