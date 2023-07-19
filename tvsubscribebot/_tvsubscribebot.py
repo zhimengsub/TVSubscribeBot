@@ -56,6 +56,7 @@ class TVSubscribeBot:
         dbfile_jobstore: str = DB_JOBSTORE,
         dbfile_cache: Path = DB_CACHE,
     ):
+        # TODO 记住用户名密码
         # TODO 检查所有更新chat_data的地方，都要手动加上mark for update
         self.persistence = PicklePersistence(
             persistence_filepath,
@@ -287,9 +288,11 @@ class TVSubscribeBot:
             await self._callbacks.notify_handle_result('参数错误！\n' + str(e), update)
             return
 
+        logger.debug('receive search cmd, args: `{}`', ' '.join(context.args))
         try:
             channels = self._search_utils.find_channels(subscriber, channel)
         except (ApiException, httpx.ConnectError) as e:
+            logger.error(str(e))
             await self._callbacks.notify_handle_result(str(e), update)
             return
 
@@ -302,6 +305,7 @@ class TVSubscribeBot:
             excludeProgram = None
 
         events = []
+        err_msgs = []
         for channel in channels:
             logger.info('searching ' + channel.service)
             try:
@@ -316,12 +320,21 @@ class TVSubscribeBot:
                     findFirstMatch
                 )
             except (ApiException, BadResultException) as e:
-                await self._callbacks.notify_handle_result(str(e), update)
+                # 报错信息整理后一起发，避免刷屏
+                err_msgs.append(str(e))
+                logger.error(str(e))
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
             if len(matches) > 0 and findFirstMatch:
                 break
+
+        logger.info('total matched events found {}', len(events))
+
+        # report error messages during channel searching
+        if err_msgs:
+            logger.debug('reporting errors during channel searching')
+            await self._callbacks.notify_handle_result('\n'.join(err_msgs), update)
 
         if len(events) == 0:
             await self._callbacks.notify_handle_result('没有找到匹配的节目！', update)
@@ -378,6 +391,7 @@ class TVSubscribeBot:
             exclude_program = None
 
         events = []
+        err_msgs = []
         for channel in channels:
             logger.info('searching ' + channel.service)
             try:
@@ -392,7 +406,9 @@ class TVSubscribeBot:
                     find_first_match
                 )
             except (ApiException, BadResultException) as e:
-                await self._callbacks.notify_handle_result(str(e), update)
+                # 报错信息整理后一起发，避免刷屏
+                err_msgs.append(str(e))
+                logger.error(str(e))
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
@@ -400,6 +416,11 @@ class TVSubscribeBot:
                 break
 
         logger.info('total matched events found {}', len(events))
+
+        # report error messages during channel searching
+        if err_msgs:
+            logger.debug('reporting errors during channel searching')
+            await self._callbacks.notify_handle_result('\n'.join(err_msgs), update)
 
         # 标记所有已订阅的节目，防止重复搜索
         subbed_events: list[Event] = context.user_data.get(KEY_SUBBED_EVENTS, [])
@@ -471,6 +492,7 @@ class TVSubscribeBot:
             exclude_program = None
 
         events = []
+        err_msgs = []
         for channel in channels:
             logger.info('searching ' + channel.service)
             try:
@@ -485,12 +507,19 @@ class TVSubscribeBot:
                     find_first_match=False
                 )
             except (ApiException, BadResultException) as e:
-                await self._callbacks.notify_handle_result(str(e), update)
+                # 报错信息整理后一起发，避免刷屏
+                err_msgs.append(str(e))
+                logger.error(str(e))
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
 
         logger.info('total matched events found {}', len(events))
+
+        # report error messages during channel searching
+        if err_msgs:
+            logger.debug('reporting errors during channel searching')
+            await self._callbacks.notify_handle_result('\n'.join(err_msgs), update)
 
         context.chat_data[KEY_LAST_DAILY_JOB_ARGS] = dict(
             channelstr=channelstr,
@@ -577,6 +606,7 @@ class TVSubscribeBot:
             exclude_program = None
 
         events = []
+        err_msgs = []
         for channel in channels:
             logger.info('searching ' + channel.service)
             try:
@@ -591,12 +621,19 @@ class TVSubscribeBot:
                     find_first_match=False
                 )
             except (ApiException, BadResultException) as e:
-                await self._callbacks.notify_handle_result(str(e), update)
+                # 报错信息整理后一起发，避免刷屏
+                err_msgs.append(str(e))
+                logger.error(str(e))
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
 
         logger.info('total matched events found {}', len(events))
+
+        # report error messages during channel searching
+        if err_msgs:
+            logger.debug('reporting errors during channel searching')
+            await self._callbacks.notify_handle_result('\n'.join(err_msgs), update)
 
         # 标记所有已订阅的节目，防止重复搜索
         subbed_events: list[Event] = context.user_data.get(KEY_SUBBED_EVENTS, [])
