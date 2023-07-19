@@ -27,11 +27,13 @@ class SearchUtils:
 
         if len(matches) == 0:
             # cache miss
-            logger.info('cache miss! Please manually refresh if needed.')
             # channel keyword not exist
             # return []
             # TODO change to cache only.
+            # logger.info('cache miss! Please manually refresh if needed.')
+            logger.info('cache miss! refresh then search again.')
             self._refresh_channel_cache(subscriber)
+            logger.debug('cache refreshed.')
             matches = self._cache.find_channels(keyword)
         else:
             logger.info('cache hit!')
