@@ -21,7 +21,7 @@
 
 - 登陆
 
-  如需更换用户只需重新执行login指令。
+  默认记住用户名和密码，如需更换用户只需重新执行login指令。
 
   `/sub login <username> <password>`
 
