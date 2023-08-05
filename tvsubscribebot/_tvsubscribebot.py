@@ -188,8 +188,8 @@ class TVSubscribeBot:
     # app 相关
     async def _initialize(self, application: 'Application'):
         # load persisted bot data
-        print(application.chat_data)
-        print(application.user_data)
+        logger.debug(f'{application.chat_data=}')
+        logger.debug(f'{application.user_data=}')
         ...
 
     def listen_forever(self, listen: str = "127.0.0.1", port: int = 18888):
@@ -253,6 +253,7 @@ class TVSubscribeBot:
             return
         context.user_data['subscriber'] = subscriber
         context.application.mark_data_for_update_persistence(user_ids=update.effective_user.id)
+        logger.debug(f'{subscriber=}')
         await self._callbacks.notify_handle_result(res['information'], update)
 
         # register jobs
@@ -771,6 +772,7 @@ class TVSubscribeBot:
         usage = self._usages_private[currfunc]
         args = [match.group() for match in context.matches]
         if not usage.check_arg_len(args):
+            logger.warning(usage.text)
             await self._callbacks.notify_handle_result(usage.text, update)
             return self._END
 
@@ -794,6 +796,7 @@ class TVSubscribeBot:
             return
 
         successed_ids, failed_ids, already_subbed_ids, result_text = self._util_subscribe(ids, last_matched_events, subscriber)
+        logger.info(result_text)
 
         # 已预约过的视为预约成功
         successed_ids.extend(already_subbed_ids)
@@ -1232,11 +1235,11 @@ class TVSubscribeBot:
     @property
     def _usages_private(self):
         return {
-            '_subscribe_now': StringArgConverter(
+            '_callback_subscribe_now': StringArgConverter(
                 '输入序号，为单个数字，或多个用","隔开的数字',
                 ids=(list[int], cast_ints)
             ),
-            '_subscribe_daily_job': StringArgConverter(
+            '_callback_subscribe_daily_job': StringArgConverter(
                 '输入"序号 jobid"，序号为单个数字，或多个用","隔开的数字，jobid为单个数字',
                 ids=(list[int], cast_ints),
                 jobid=(int, None)
