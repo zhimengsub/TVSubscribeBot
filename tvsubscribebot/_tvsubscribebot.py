@@ -1,4 +1,5 @@
 import inspect
+import traceback
 from pathlib import Path
 from typing import Coroutine, TYPE_CHECKING, Union, TypeVar
 from typing import Dict, Optional, List
@@ -188,8 +189,10 @@ class TVSubscribeBot:
     # app 相关
     async def _initialize(self, application: 'Application'):
         # load persisted bot data
-        logger.debug(f'{application.chat_data=}')
-        logger.debug(f'{application.user_data=}')
+        chat_data = dict(application.chat_data)
+        user_data = dict(application.user_data)
+        logger.debug(f'{chat_data=}')
+        logger.debug(f'{user_data=}')
         ...
 
     def listen_forever(self, listen: str = "127.0.0.1", port: int = 18888):
@@ -830,7 +833,8 @@ class TVSubscribeBot:
         # 如果只有一个触发任务，则直接输入订阅序号，否则需要输入jobid和序号。
         currfunc = inspect.currentframe().f_code.co_name
         usage = self._usages_private[currfunc]
-        args = context.match.groups()  # only retrieve those in brackets
+
+        args = [arg for arg in context.match.groups() if arg is not None]  # only retrieve those in brackets and is not None
         if not usage.check_arg_len(args):
             await self._callbacks.notify_handle_result(usage.usage, update)
             return self._END
@@ -841,10 +845,12 @@ class TVSubscribeBot:
             return self._END
 
         unhandled_matches: Dict[Union[JOB_NAME, JOB_NAME_ONCE], EVENT_DICT] = context.chat_data.get(KEY_UNHANDLED_MATCHES, {})
+        # logger.debug(f'{unhandled_matches=}')
         jobs_mapping: JobsMapping = context.chat_data.get(KEY_JOB_MAPPING, JobsMapping())
         try:
             # 检查未处理list是否只有一个，有多个则提示需要输入jobid。
             ids, outer_id = usage.parse_args(args)
+            logger.debug(f'parsed args: {ids=}, {outer_id=}')
             if outer_id is None:
                 if len(unhandled_matches) > 1:
                     await self._callbacks.notify_handle_result('有多个待处理结果，请输入jobid！', update)
@@ -856,8 +862,9 @@ class TVSubscribeBot:
             if outer_id is None or inner_id is None or not last_matched_events:
                 await self._callbacks.notify_handle_result('无法获取jobid' + str(outer_id) + '的搜索结果！', update)
                 return self._END
-            assert all(0 <= id <= len(last_matched_events) for id in ids)
+            assert all(0 <= id <= len(last_matched_events) for id in ids), '序号超出范围！'
         except (AssertionError, SyntaxError, TypeError, ValueError) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('参数错误，请重新输入！\n' + str(e), update)
             return
 
