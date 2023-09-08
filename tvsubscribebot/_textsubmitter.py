@@ -4,7 +4,7 @@ from dumb_bot.dumbbot import Message, UpdateGenerator, User, Chat
 from tvsubscribebot.utils.casts import *
 
 DEFAULT_USER = User(0, 'dummy', False, username='dummyuser')
-DEFAULT_CHAT = Chat(0, Chat.PRIVATE)
+DEFAULT_CHAT = Chat(0, Chat.PRIVATE, username='dummyuser')
 
 
 class TextSubmitter:
