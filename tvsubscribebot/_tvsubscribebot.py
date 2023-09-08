@@ -100,7 +100,16 @@ class TVSubscribeBot:
                 # ChainCommandHandler('enable', self.task_enable),
                 ChainCommandHandler('remove', self._cmd_remove),
                 ChainCommandHandler('userinfo', self._cmd_userinfo),
-                # ChainCommandHandler('refresh_cache', self.refresh_cache)
+            ]
+        )
+        # debugging
+        self.cmd_handlers_debug = ChainCommandHandler(
+            '/sub',
+            sub_command_handlers=[
+                ChainCommandHandler('clean', sub_command_handlers=[
+                    ChainCommandHandler('unhandled', self._cmd_clean_unhandled_events)
+                ]),
+                ChainCommandHandler('show_data', callback=self._cmd_show_data)
             ]
         )
 
@@ -171,6 +180,7 @@ class TVSubscribeBot:
         self.backup_handler = ChainCommandHandler('/sub', self._cmd_help)
 
         self._app.add_handler(self.cmd_handlers_simple)
+        self._app.add_handler(self.cmd_handlers_debug)
         self._app.add_handler(self.conv_sub_now)
         self._app.add_handler(self.conv_sub_daily)
         self._app.add_handler(self.conv_sub_check)
@@ -189,8 +199,14 @@ class TVSubscribeBot:
     # app 相关
     async def _initialize(self, application: 'Application'):
         # load persisted bot data
+        # remove datas
+        # application.drop_chat_data(chat_id)
+        # application.drop_user_data(user_id)
+        # update persistence now, instead of mark_data_for_update_persistence()
+        # application.update_persistence()
         chat_data = dict(application.chat_data)
         user_data = dict(application.user_data)
+        # TODO user_data 的 KEY_SUBBED_EVENTS 改为从线上获取，并且改为保存到subscriber里，每次登陆时/JobsManager.job_update_subbed_events里自动更新。本地保存的话存在多用户使用同一份记录的问题
         logger.debug(f'{chat_data=}')
         logger.debug(f'{user_data=}')
         ...
@@ -200,8 +216,9 @@ class TVSubscribeBot:
         logger.info('listening at {}:{}', listen, port)
         try:
             self._app.run(listen, port)
-        except pymongo.errors.ServerSelectionTimeoutError:
+        except (pymongo.errors.ServerSelectionTimeoutError, Exception):
             logger.error('无法连接到jobstore！')
+            logger.error(traceback.format_exc())
 
     # public utils
     def register_callback(self, func: Callable[[RESULT_TEXT, Chat], Coroutine]) -> Callable[[RESULT_TEXT, Chat], Coroutine]:
@@ -235,6 +252,37 @@ class TVSubscribeBot:
         subbed_events: list[Event] = context.user_data.setdefault(KEY_SUBBED_EVENTS, [])
         subbed_events.append(event)
 
+    async def _cmd_clean_unhandled_events(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            context.chat_data.__setitem__(KEY_UNHANDLED_MATCHES, {})
+            context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
+            logger.debug('cleaned unhandled events, chat data of id {} is:\n{}', update.effective_chat.id, context.chat_data)
+            await self._callbacks.notify_handle_result('cleaned', update)
+        except Exception as e:
+            logger.error('clean unhandled events failed!\n{}', traceback.format_exc())
+            await self._callbacks.notify_handle_result('clean failed!\n' + str(e), update)
+
+    async def _cmd_show_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_data = dict(context.chat_data)
+        user_data = dict(context.user_data)
+        # TODO user_data 的 KEY_SUBBED_EVENTS 改为从线上获取，并且改为保存到subscriber里，每次登陆时/JobsManager.job_update_subbed_events里自动更新。本地保存的话存在多用户使用同一份记录的问题
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        logger.debug(f'{chat_id=}, {chat_data=}')
+        logger.debug(f'{user_id=}, {user_data=}')
+        user_info = f'{user_id=}\n{user_data=}'
+        chat_info = f'{chat_id=}\n{chat_data=}'
+        if len(context.args) == 0:
+            # show all data
+            res = user_info + '\n' + chat_info
+        elif context.args[0] == 'chat':
+            res = chat_info
+        elif context.args[0] == 'user':
+            res = user_info
+        else:
+            res = 'args are: <empty> | user | chat'
+        await self._callbacks.notify_handle_result(res, update)
+
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         usages = [usage.text for usage in self._usages.values()]
         await self._callbacks.notify_handle_result('\n'.join(usages), update)
@@ -251,7 +299,8 @@ class TVSubscribeBot:
         subscriber = TVSubscriber()
         try:
             res = subscriber.login(username, password)
-        except (ApiException, httpx.ConnectError) as e:
+        except (ApiException, httpx.RequestError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result(str(e), update)
             return
         context.user_data['subscriber'] = subscriber
@@ -260,6 +309,7 @@ class TVSubscribeBot:
         await self._callbacks.notify_handle_result(res['information'], update)
 
         # register jobs
+        logger.debug('registered job to update subbed events every {} seconds', INT_UPDATE_SUBBED_EVENTS)
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         context.job_queue.run_repeating(
@@ -288,15 +338,16 @@ class TVSubscribeBot:
         try:
             channel, program, \
             excludeProgram, detail, startDate, startTime, findFirstMatch = usage.parse_args(context.args)
-        except (SyntaxError, TypeError, ValueError) as e:
+        except (SyntaxError, TypeError, ValueError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('参数错误！\n' + str(e), update)
             return
 
         logger.debug('receive search cmd, args: `{}`', ' '.join(context.args))
         try:
             channels = self._search_utils.find_channels(subscriber, channel)
-        except (ApiException, httpx.ConnectError) as e:
-            logger.error(str(e))
+        except (ApiException, httpx.RequestError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result(str(e), update)
             return
 
@@ -323,10 +374,10 @@ class TVSubscribeBot:
                     startTime,
                     findFirstMatch
                 )
-            except (ApiException, BadResultException) as e:
+            except (ApiException, BadResultException, Exception) as e:
                 # 报错信息整理后一起发，避免刷屏
                 err_msgs.append(str(e))
-                logger.error(str(e))
+                logger.error(traceback.format_exc())
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
@@ -376,13 +427,15 @@ class TVSubscribeBot:
         try:
             channelstr, programstr, \
             exclude_program, detail, start_date, start_time, find_first_match = usage.parse_args(context.args)
-        except (SyntaxError, TypeError, ValueError) as e:
+        except (SyntaxError, TypeError, ValueError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('参数错误！\n' + str(e), update)
             return self._END
 
         try:
             channels = self._search_utils.find_channels(subscriber, channelstr)
-        except (ApiException, httpx.ConnectError) as e:
+        except (ApiException, httpx.RequestError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result(str(e), update)
             return self._END
 
@@ -409,10 +462,10 @@ class TVSubscribeBot:
                     start_time,
                     find_first_match
                 )
-            except (ApiException, BadResultException) as e:
+            except (ApiException, BadResultException, Exception) as e:
                 # 报错信息整理后一起发，避免刷屏
                 err_msgs.append(str(e))
-                logger.error(str(e))
+                logger.error(traceback.format_exc())
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
@@ -476,14 +529,16 @@ class TVSubscribeBot:
         try:
             channelstr, programstr, \
             exclude_program, detail, check_time, days, start_time = usage.parse_args(context.args)
-        except (SyntaxError, TypeError, ValueError) as e:
+        except (SyntaxError, TypeError, ValueError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('参数错误！\n' + str(e), update)
             return self._END
 
         # first prompt result, add job after user respond
         try:
             channels = self._search_utils.find_channels(subscriber, channelstr)
-        except (ApiException, httpx.ConnectError) as e:
+        except (ApiException, httpx.RequestError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result(str(e), update)
             return self._END
 
@@ -510,10 +565,10 @@ class TVSubscribeBot:
                     start_time=start_time,
                     find_first_match=False
                 )
-            except (ApiException, BadResultException) as e:
+            except (ApiException, BadResultException, Exception) as e:
                 # 报错信息整理后一起发，避免刷屏
                 err_msgs.append(str(e))
-                logger.error(str(e))
+                logger.error(traceback.format_exc())
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
@@ -568,7 +623,8 @@ class TVSubscribeBot:
 
         try:
             (jobid,) = usage.parse_args(context.args)
-        except (SyntaxError, TypeError, ValueError) as e:
+        except (SyntaxError, TypeError, ValueError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result(usage.text + '\n' + str(e), update)
             return self._END
 
@@ -581,7 +637,8 @@ class TVSubscribeBot:
         try:
             # get args from job's data
             job: Job = context.job_queue.get_jobs_by_name(job_name)[0]
-        except IndexError:
+        except (IndexError, Exception):
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('找不到job_name' + job_name, update)
             return self._END
 
@@ -597,7 +654,8 @@ class TVSubscribeBot:
         # prompt result
         try:
             channels = self._search_utils.find_channels(subscriber, channelstr)
-        except (ApiException, httpx.ConnectError) as e:
+        except (ApiException, httpx.RequestError, Exception) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result(str(e), update)
             return self._END
 
@@ -624,10 +682,10 @@ class TVSubscribeBot:
                     start_time=start_time,
                     find_first_match=False
                 )
-            except (ApiException, BadResultException) as e:
+            except (ApiException, BadResultException, Exception) as e:
                 # 报错信息整理后一起发，避免刷屏
                 err_msgs.append(str(e))
-                logger.error(str(e))
+                logger.error(traceback.format_exc())
                 continue
             logger.info('matched events found {}', len(matches))
             events.extend(matches)
@@ -715,7 +773,7 @@ class TVSubscribeBot:
         try:
             jobids: list[int]
             (jobids,) = usage.parse_args(context.args)
-        except (SyntaxError, TypeError, ValueError) as e:
+        except (SyntaxError, TypeError, ValueError, Exception) as e:
             await self._callbacks.notify_handle_result(usage.text + '\n' + str(e), update)
             return self._END
 
@@ -744,6 +802,7 @@ class TVSubscribeBot:
                         jobs_mapping.remove_by_inner(job_name)
                         msg += '删除成功'
                     except Exception as e:
+                        logger.error(traceback.format_exc())
                         msg += '删除失败，' + str(e)
             retmsg.append(msg)
 
@@ -795,7 +854,12 @@ class TVSubscribeBot:
             (ids,) = usage.parse_args(args)
             assert all(0 <= id <= len(last_matched_events) for id in ids)
         except (AssertionError, SyntaxError, TypeError, ValueError) as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('序号错误，请重新输入！\n' + str(e), update)
+            return
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            await self._callbacks.notify_handle_result('未知错误\n' + str(e), update)
             return
 
         successed_ids, failed_ids, already_subbed_ids, result_text = self._util_subscribe(ids, last_matched_events, subscriber)
@@ -815,14 +879,14 @@ class TVSubscribeBot:
                 user_ids=update.effective_user.id,
             )
 
+        await self._callbacks.notify_handle_result(result_text, update)
+
         if failed_ids:
             # stay in current state if any failed
             return
 
         # clear data if all success (or cancled)
         unhandled_matches.pop(KEY_JOB_NAME_ONCE)
-
-        await self._callbacks.notify_handle_result(result_text, update)
 
         return self._END
 
@@ -867,6 +931,10 @@ class TVSubscribeBot:
             logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('参数错误，请重新输入！\n' + str(e), update)
             return
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            await self._callbacks.notify_handle_result('未知错误\n' + str(e), update)
+            return
 
         successed_ids, failed_ids, already_subbed_ids, result_text = self._util_subscribe(ids, last_matched_events, subscriber)
 
@@ -884,14 +952,14 @@ class TVSubscribeBot:
                 user_ids=update.effective_user.id,
             )
 
+        await self._callbacks.notify_handle_result(result_text, update)
+
         if failed_ids:
             # stay in current state if any failed
             return
 
         # clear data if all success
         unhandled_matches.pop(inner_id)
-
-        await self._callbacks.notify_handle_result(result_text, update)
 
         return self._END
 
@@ -907,6 +975,7 @@ class TVSubscribeBot:
             for key in ['channelstr', 'programstr', 'exclude_program', 'detail', 'check_time', 'days', 'start_time']:
                 assert key in last_daily_job_args
         except AssertionError as e:
+            logger.error(traceback.format_exc())
             await self._callbacks.notify_handle_result('无法获取用户定时任务参数！\n' + str(e), update)
             return self._END
 
@@ -1013,7 +1082,8 @@ class TVSubscribeBot:
                 assert job_name is not None
                 unhandled_matches.pop(job_name)
                 context.application.mark_data_for_update_persistence(chat_ids=update.effective_chat.id)
-            except (AssertionError, KeyError):
+            except (AssertionError, KeyError, Exception):
+                logger.error(traceback.format_exc())
                 await self._callbacks.notify_handle_result(self._prompt_jobid_not_found(suffix), update)
                 return
 
@@ -1057,7 +1127,8 @@ class TVSubscribeBot:
                 reservation = self._do_subscribe(subscriber, event)
                 reservations.append(reservation)
                 successed_ids.append(id)
-            except (ApiException, httpx.ConnectError) as e:
+            except (ApiException, httpx.RequestError, Exception) as e:
+                logger.error(traceback.format_exc())
                 if '已经预约过' in str(e):
                     already_subbed_ids.append(id)
                 else:
@@ -1067,7 +1138,8 @@ class TVSubscribeBot:
         try:
             userinfo = subscriber.get_userinfo()
             result_text = '余额：' + userinfo.wallet + '元\n'
-        except (ApiException, httpx.ConnectError):
+        except (ApiException, httpx.RequestError, Exception):
+            logger.error(traceback.format_exc())
             result_text = '余额获取失败\n'
 
         if successed_ids:
