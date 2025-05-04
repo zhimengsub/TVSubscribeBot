@@ -73,6 +73,7 @@ class TVSubscribeBot:
             .build()
 
         # https://github.com/python-telegram-bot/ptbcontrib/blob/main/ptbcontrib/ptb_jobstores/README.md
+        # make jobs persistent
         self._app.job_queue.scheduler.add_jobstore(
             PTBMongoDBJobStore(
                 application=self._app,
