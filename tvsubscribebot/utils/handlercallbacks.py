@@ -9,7 +9,7 @@ class HandlerCallbacks:
     def __init__(self):
         self._callbacks: List[Callable[[RESULT_TEXT, Chat, User], Coroutine]] = []
 
-    def register_callback(self, func: Callable[[RESULT_TEXT, Chat], Coroutine]) -> Callable[[RESULT_TEXT, Chat], Coroutine]:
+    def register_callback(self, func: Callable[[RESULT_TEXT, Chat, User], Coroutine]) -> Callable[[RESULT_TEXT, Chat, User], Coroutine]:
         """Register coroutine callback for handling result text, can be used as a decorator."""
         self._callbacks.append(func)
         return func
