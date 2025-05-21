@@ -3,6 +3,7 @@ from typing import TypeVar, Dict, Optional, Literal
 from tvsubscriber import Event
 
 USER_ID = TypeVar('USER_ID', bound=int)
+CHAT_ID = TypeVar('CHAT_ID', bound=int)
 RESULT_TEXT = str
 EVENT_ID = TypeVar('EVENT_ID', bound=int)
 EVENT_DICT = Dict[EVENT_ID, Optional[Event]]
