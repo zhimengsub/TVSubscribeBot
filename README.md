@@ -11,13 +11,13 @@
 
 - requirements for scheduled jobs ability
   - `pip install git+https://github.com/python-telegram-bot/ptbcontrib.git@main`
-  - `python-telegram-bot[job-queue]~=20.0`
+  - `python-telegram-bot[job-queue]~=20.3`
   - `SQLAlchemy==1.4.46`
   - `pymongo>=4.1,<5`
   - [Set up a Mongodb server](https://www.mongodb.com/docs/v6.0/tutorial/install-mongodb-on-ubuntu/) listening at 27017 (default port)
 
 - requirements of tvsubscriber:
-  - pydantic
+  - `pydantic==2.0.3`
 
 ## Usage example
 
